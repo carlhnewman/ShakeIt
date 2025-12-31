@@ -1,25 +1,37 @@
-# dependencies
-node_modules/
-
-# Expo
-.expo/
-.expo-shared/
-
-# OS junk
+# --- OS / editor ---
 .DS_Store
+*.swp
+*.swo
+*.log
+.vscode/
+.idea/
 
-# env files
-.env
-.env.*
-
-# Firebase
-.firebase/
-
-# logs
+# --- Node ---
+node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 
-# build
+# --- Expo ---
+.expo/
+.expo-shared/
+web-build/
 dist/
-build/
+coverage/
+
+# --- React Native ---
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+ios/Pods/
+ios/build/
+ios/DerivedData/
+*.xcworkspace
+*.xcuserstate
+*.xcuserdata/
+
+# --- Env ---
+.env
+.env.*
