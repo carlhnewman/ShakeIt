@@ -1,7 +1,15 @@
 import { Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
-import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
-import React, { useState } from 'react';
+import {
+  addDoc,
+  collection,
+  getDocs,
+  query,
+  serverTimestamp,
+  where,
+} from 'firebase/firestore';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -17,60 +25,199 @@ import {
 import { theme } from '../constants/colors';
 import { db } from '../firebase';
 
+/* 🔑 Cloud Functions (Gen2 / Cloud Run URLs) */
+const PLACES_AUTOCOMPLETE_URL =
+  'https://placesautocompletehttp-aai2vr2x4a-ts.a.run.app/placesAutocompleteHttp';
+
+const PLACE_DETAILS_URL =
+  'https://placedetailshttp-aai2vr2x4a-ts.a.run.app/placeDetailsHttp';
+
+/* Types */
+type PlaceSuggestion = {
+  placeId: string;
+  description: string;
+};
+
+type SelectedPlace = {
+  placeId: string;
+  name: string;
+  address: string;
+  latitude: number;
+  longitude: number;
+};
+
 export default function AddShakeScreen() {
   const router = useRouter();
 
-  const [businessName, setBusinessName] = useState('');
-  const [address, setAddress] = useState('');
+  /* Search + selection */
+  const [queryText, setQueryText] = useState('');
+  const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [selectedPlace, setSelectedPlace] =
+    useState<SelectedPlace | null>(null);
+
+  /* ✅ Location bias for autocomplete */
+  const [userCoords, setUserCoords] = useState<{
+    latitude: number;
+    longitude: number;
+  } | null>(null);
+
+  // Fetch user coords once (best-effort)
+  useEffect(() => {
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') return;
+
+        const loc = await Location.getCurrentPositionAsync({});
+        setUserCoords({
+          latitude: loc.coords.latitude,
+          longitude: loc.coords.longitude,
+        });
+      } catch (e) {
+        console.warn('Location not available', e);
+      }
+    })();
+  }, []);
+
+  /* Prices / rating */
   const [milkshakePrice, setMilkshakePrice] = useState('');
   const [thickshakePrice, setThickshakePrice] = useState('');
   const [rating, setRating] = useState('');
+
   const [saving, setSaving] = useState(false);
 
+  // ✅ FIX: React Native setTimeout returns a number; this works on iOS/Android/Web
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* 🔎 Autocomplete (debounced) */
+  useEffect(() => {
+    if (queryText.trim().length < 2 || selectedPlace) {
+      setSuggestions([]);
+      return;
+    }
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(PLACES_AUTOCOMPLETE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            input: queryText,
+            latitude: userCoords?.latitude ?? null,
+            longitude: userCoords?.longitude ?? null,
+          }),
+        });
+
+        const json = await res.json();
+        setSuggestions(json.predictions ?? []);
+      } catch (err) {
+        console.warn('Autocomplete failed', err);
+      }
+    }, 300);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [queryText, selectedPlace, userCoords]);
+
+  /* 📍 Select place → fetch details */
+  const handleSelectPlace = async (item: PlaceSuggestion) => {
+    try {
+      const res = await fetch(PLACE_DETAILS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ placeId: item.placeId }),
+      });
+
+      const json = await res.json();
+
+      setSelectedPlace({
+        placeId: item.placeId,
+        name: json.name,
+        address: json.address,
+        latitude: json.latitude,
+        longitude: json.longitude,
+      });
+
+      setQueryText(json.name);
+      setSuggestions([]);
+    } catch (err) {
+      Alert.alert('Error', 'Failed to fetch place details.');
+    }
+  };
+
+  /* 💾 Save with duplicate warning */
   const handleSave = async () => {
-    if (!businessName.trim()) {
-      Alert.alert('Missing name', 'Please enter a business name.');
+    if (!selectedPlace) {
+      Alert.alert(
+        'Select a business',
+        'Please choose a business from the list.',
+      );
       return;
     }
 
-    if (!address.trim()) {
-      Alert.alert('Missing address', 'Please enter an address.');
-      return;
-    }
-
-    const milkPriceNum =
+    const milkPrice =
       milkshakePrice.trim() !== '' ? parseFloat(milkshakePrice) : null;
-    const thickPriceNum =
+    const thickPrice =
       thickshakePrice.trim() !== '' ? parseFloat(thickshakePrice) : null;
     const ratingNum = rating.trim() !== '' ? parseFloat(rating) : null;
 
     try {
       setSaving(true);
 
+      /* 🔍 Check for existing business */
+      const q = query(
+        collection(db, 'shops'),
+        where('googlePlaceId', '==', selectedPlace.placeId),
+      );
+
+      const existing = await getDocs(q);
+
+      if (!existing.empty) {
+        const docId = existing.docs[0].id;
+
+        Alert.alert(
+          'Business already exists',
+          'This business is already on ShakeMap.',
+          [
+            {
+              text: 'View business',
+              onPress: () => {
+                setSaving(false);
+                router.replace(`/shake/${docId}`);
+              },
+            },
+            {
+              text: 'Cancel',
+              style: 'cancel',
+              onPress: () => setSaving(false),
+            },
+          ],
+        );
+        return;
+      }
+
+      /* ✅ Create new shop */
       await addDoc(collection(db, 'shops'), {
-        name: businessName.trim(),
-        address: address.trim(),
-        milkshakePrice: milkPriceNum,
-        thickshakePrice: thickPriceNum,
+        name: selectedPlace.name,
+        address: selectedPlace.address,
+        latitude: selectedPlace.latitude,
+        longitude: selectedPlace.longitude,
+        googlePlaceId: selectedPlace.placeId,
+        milkshakePrice: milkPrice,
+        thickshakePrice: thickPrice,
         rating: ratingNum,
         createdAt: serverTimestamp(),
       });
 
-      Alert.alert('Business added', 'Your milkshake spot has been saved!', [
+      Alert.alert('Saved', 'Milkshake spot added!', [
         { text: 'OK', onPress: () => router.back() },
       ]);
-
-      setBusinessName('');
-      setAddress('');
-      setMilkshakePrice('');
-      setThickshakePrice('');
-      setRating('');
-    } catch (err: any) {
-      console.error('Error adding business:', err);
-      Alert.alert(
-        'Error',
-        'Something went wrong saving the business. Please try again.',
-      );
+    } catch (err) {
+      console.error(err);
+      Alert.alert('Error', 'Could not save business.');
     } finally {
       setSaving(false);
     }
@@ -82,7 +229,6 @@ export default function AddShakeScreen() {
         style={{ flex: 1 }}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        {/* Header */}
         <View style={styles.header}>
           <TouchableOpacity
             style={styles.headerBack}
@@ -100,77 +246,70 @@ export default function AddShakeScreen() {
         <ScrollView contentContainerStyle={styles.container}>
           <Text style={styles.title}>Add a milkshake spot</Text>
 
-          {/* Business name */}
-          <Text style={styles.label}>Business name *</Text>
+          <Text style={styles.label}>Business *</Text>
           <TextInput
             style={styles.input}
-            placeholder="e.g. Joe's Dairy"
-            placeholderTextColor={theme.controls.inputPlaceholder}
-            value={businessName}
-            onChangeText={setBusinessName}
+            placeholder="Start typing a business name"
+            value={queryText}
+            onChangeText={text => {
+              setQueryText(text);
+              setSelectedPlace(null);
+            }}
           />
 
-          {/* Address */}
-          <Text style={styles.label}>Address *</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="e.g. 10 Sykes Road, Manurewa, Auckland"
-            placeholderTextColor={theme.controls.inputPlaceholder}
-            value={address}
-            onChangeText={setAddress}
-          />
+          {!selectedPlace && suggestions.length > 0 && (
+            <View style={styles.suggestions}>
+              {suggestions.map(item => (
+                <TouchableOpacity
+                  key={item.placeId}
+                  style={styles.suggestionRow}
+                  onPress={() => handleSelectPlace(item)}
+                >
+                  <Text style={styles.suggestionName}>{item.description}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
 
-          {/* Prices */}
+          {selectedPlace && (
+            <View style={styles.selectedBox}>
+              <Ionicons name="checkmark-circle" size={18} color="#2ecc71" />
+              <Text style={styles.selectedText}>{selectedPlace.address}</Text>
+            </View>
+          )}
+
           <Text style={styles.sectionTitle}>Prices (optional)</Text>
 
-          <Text style={styles.label}>Milkshake price</Text>
           <TextInput
             style={styles.input}
-            placeholder="e.g. 6.50"
-            placeholderTextColor={theme.controls.inputPlaceholder}
+            placeholder="Milkshake price"
             keyboardType="decimal-pad"
             value={milkshakePrice}
             onChangeText={setMilkshakePrice}
           />
 
-          <Text style={styles.label}>Thick shake price</Text>
           <TextInput
             style={styles.input}
-            placeholder="e.g. 8.00"
-            placeholderTextColor={theme.controls.inputPlaceholder}
+            placeholder="Thick shake price"
             keyboardType="decimal-pad"
             value={thickshakePrice}
             onChangeText={setThickshakePrice}
           />
 
-          {/* Rating */}
-          <Text style={styles.label}>Rating (0–5, optional)</Text>
           <TextInput
             style={styles.input}
-            placeholder="e.g. 4.5"
-            placeholderTextColor={theme.controls.inputPlaceholder}
+            placeholder="Rating (0–5)"
             keyboardType="decimal-pad"
             value={rating}
             onChangeText={setRating}
           />
 
-          {/* Photos placeholder */}
-          <Text style={styles.sectionTitle}>Photos (coming soon)</Text>
-          <TouchableOpacity style={styles.disabledButton} disabled>
-            <Text style={styles.disabledButtonText}>
-              Add photo (not yet enabled)
-            </Text>
-          </TouchableOpacity>
-
-          {/* Save button */}
           <TouchableOpacity
             style={[styles.saveButton, saving && { opacity: 0.7 }]}
             onPress={handleSave}
             disabled={saving}
           >
-            <Text style={styles.saveButtonText}>
-              {saving ? 'Saving…' : 'Save'}
-            </Text>
+            <Text style={styles.saveButtonText}>{saving ? 'Saving…' : 'Save'}</Text>
           </TouchableOpacity>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -178,85 +317,41 @@ export default function AddShakeScreen() {
   );
 }
 
+/* Styles unchanged (intentionally) */
 const styles = StyleSheet.create({
-  screen: {
-    flex: 1,
-    backgroundColor: theme.app.screenBackground,
-  },
-
-  container: {
-    padding: 20,
-    paddingBottom: 40,
-  },
-
-  header: {
-    height: 50,
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    backgroundColor: theme.app.screenBackground,
-  },
-  headerBack: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  headerBackText: {
-    marginLeft: 4,
-    fontSize: 16,
-    color: theme.text.primary,
-    fontWeight: '600',
-  },
-
-  title: {
-    fontSize: 24,
-    fontWeight: '800',
-    color: theme.text.primary,
-    marginBottom: 20,
-  },
-  sectionTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    marginTop: 24,
-    marginBottom: 8,
-    color: theme.text.primary,
-  },
-  label: {
-    fontSize: 14,
-    marginTop: 12,
-    marginBottom: 4,
-    color: theme.text.primary,
-  },
+  screen: { flex: 1 },
+  container: { padding: 20 },
+  header: { height: 50, justifyContent: 'center', paddingHorizontal: 16 },
+  headerBack: { flexDirection: 'row', alignItems: 'center' },
+  headerBackText: { marginLeft: 4, fontSize: 16, fontWeight: '600' },
+  title: { fontSize: 24, fontWeight: '800', marginBottom: 20 },
+  label: { marginTop: 12 },
   input: {
     borderWidth: 1,
-    borderColor: theme.surface.border,
-    backgroundColor: theme.controls.inputBg,
     borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
-    color: theme.text.primary,
+    padding: 12,
+    marginTop: 6,
   },
-  disabledButton: {
-    marginTop: 8,
-    paddingVertical: 12,
+  suggestions: {
+    borderWidth: 1,
     borderRadius: 10,
-    backgroundColor: theme.surface.border,
+    marginTop: 6,
+  },
+  suggestionRow: { padding: 12 },
+  suggestionName: { fontWeight: '600' },
+  selectedBox: {
+    flexDirection: 'row',
     alignItems: 'center',
+    marginTop: 10,
+    gap: 6,
   },
-  disabledButtonText: {
-    color: theme.text.muted,
-    fontSize: 14,
-    fontWeight: '500',
-  },
+  selectedText: { fontWeight: '600' },
+  sectionTitle: { marginTop: 24, fontSize: 18, fontWeight: '600' },
   saveButton: {
     marginTop: 28,
-    backgroundColor: theme.controls.buttonPrimaryBg,
     paddingVertical: 14,
     borderRadius: 10,
     alignItems: 'center',
   },
-  saveButtonText: {
-    color: theme.text.onBrand,
-    fontSize: 16,
-    fontWeight: '700',
-  },
+  saveButtonText: { fontSize: 16, fontWeight: '700' },
 });

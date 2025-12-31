@@ -36,13 +36,13 @@ export const theme = {
     primary: palette.almostBlack,
     secondary: palette.muted,
     muted: palette.mutedLight,
-    onBrand: palette.cream,         // text on primary buttons
+    onBrand: palette.white,         // ✅ high-contrast text on brand buttons
     onDark: palette.white,
     onLight: palette.almostBlack,
   },
 
   brand: {
-    primary: palette.mint,          // main brand colour (buttons, active)
+    primary: palette.darkMint,      // ✅ deeper mint = more contrast
     primarySoft: '#D6F2EA',
     accent: palette.shakeRed,       // red accent (logo, key CTAs)
     accentSoft: '#FFD3D3',
@@ -64,9 +64,9 @@ export const theme = {
     buttonPrimaryText: palette.cream,
 
     // Secondary = mint / cream
-    buttonSecondaryBg: palette.mint,
-    buttonSecondaryText: palette.almostBlack,
-    buttonSecondaryBorder: palette.mint,
+    buttonSecondaryBg: palette.darkMint,      // ✅ darker mint
+    buttonSecondaryText: palette.cream,       // ✅ light text on darkMint
+    buttonSecondaryBorder: palette.darkMint,
 
     chipBg: palette.cream,
     chipBorder: palette.mint,

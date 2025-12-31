@@ -25,6 +25,13 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        console.log('🔥 MY FIREBASE UID:', firebaseUser.uid);
+        console.log('🔥 MY EMAIL:', firebaseUser.email);
+      } else {
+        console.log('🔥 SIGNED OUT');
+      }
+
       setUser(firebaseUser);
       setLoading(false);
     });

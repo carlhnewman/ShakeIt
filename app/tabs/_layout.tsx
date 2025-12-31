@@ -11,11 +11,11 @@ export default function Layout() {
         screenOptions={({ route }) => ({
           headerShown: false,
 
-          // ✅ ACTIVE / INACTIVE TAB COLOURS (future-proofed)
+          // Active / inactive colours
           tabBarActiveTintColor: theme.text.primary,
           tabBarInactiveTintColor: theme.text.muted,
 
-          // ✅ TAB BAR SURFACE (this is part of your "menu system")
+          // Tab bar surface
           tabBarStyle: {
             height: 80,
             paddingBottom: 20,
@@ -25,15 +25,13 @@ export default function Layout() {
             borderTopColor: theme.surface.border,
           },
 
-          // ✅ LABEL STYLE (text system)
+          // Label style (DON'T set color here, tintColor handles it)
           tabBarLabelStyle: {
             fontSize: 13,
             fontWeight: '600',
             paddingBottom: 6,
-            color: theme.text.primary,
           },
 
-          // ✅ ICON SYSTEM (driven by theme)
           tabBarIcon: ({ focused, color }) => {
             let iconName: keyof typeof Ionicons.glyphMap;
 
@@ -47,16 +45,32 @@ export default function Layout() {
               iconName = 'ellipse-outline';
             }
 
-            return (
-              <Ionicons
-                name={iconName}
-                size={28}
-                color={color}
-              />
-            );
+            return <Ionicons name={iconName} size={28} color={color} />;
           },
         })}
-      />
+      >
+        <Tabs.Screen
+          name="index"
+          options={{
+            title: 'Home',
+            tabBarLabel: 'Home',
+          }}
+        />
+        <Tabs.Screen
+          name="explore"
+          options={{
+            title: 'Explore',
+            tabBarLabel: 'Explore',
+          }}
+        />
+        <Tabs.Screen
+          name="favourites"
+          options={{
+            title: 'Favourites',
+            tabBarLabel: 'Favourites',
+          }}
+        />
+      </Tabs>
     </ExploreHighlightProvider>
   );
 }

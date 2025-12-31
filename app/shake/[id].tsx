@@ -2,9 +2,10 @@
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { doc, getDoc } from 'firebase/firestore';
-import React, { useEffect, useState } from 'react';
+import { doc, getDoc, setDoc, Timestamp } from 'firebase/firestore';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
   Dimensions,
   Image,
@@ -18,6 +19,7 @@ import {
   View,
 } from 'react-native';
 import { theme } from '../../constants/colors';
+import { useAuth } from '../../context/AuthContext';
 import { db } from '../../firebase';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -29,7 +31,14 @@ type Shop = {
   name: string;
   area?: string;
   address?: string;
+
+  // legacy / fallback
   rating?: number | null;
+
+  // ✅ new aggregate fields updated by your Cloud Function
+  ratingAverage?: number | null;
+  ratingCount?: number | null;
+
   milkshakePrice?: number | null;
   thickshakePrice?: number | null;
   latitude?: number | null;
@@ -45,6 +54,8 @@ const CORE_SHOPS: Shop[] = [
     area: 'Gisborne',
     address: '285 Grey Street, Gisborne',
     rating: 4.5,
+    ratingAverage: 4.5,
+    ratingCount: 0,
     milkshakePrice: 6.5,
     thickshakePrice: 9,
     latitude: -38.6704,
@@ -57,6 +68,8 @@ const CORE_SHOPS: Shop[] = [
     area: 'Te Poi',
     address: '5 Te Poi Road, Te Poi',
     rating: 4.5,
+    ratingAverage: 4.5,
+    ratingCount: 0,
     milkshakePrice: 6,
     thickshakePrice: 8,
     latitude: -37.8724,
@@ -69,6 +82,8 @@ const CORE_SHOPS: Shop[] = [
     area: 'Ōpōtiki',
     address: '43 Saint John Street, Ōpōtiki',
     rating: 4.0,
+    ratingAverage: 4.0,
+    ratingCount: 0,
     milkshakePrice: 5.5,
     thickshakePrice: 8,
     latitude: -38.0118,
@@ -80,10 +95,16 @@ const CORE_SHOPS: Shop[] = [
 export default function ShakeDetailsScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
+  const { user } = useAuth();
 
   const [shop, setShop] = useState<Shop | null>(null);
   const [loading, setLoading] = useState(true);
   const [favourites, setFavourites] = useState<string[]>([]);
+
+  // ⭐ rating state (per-user)
+  const [myRating, setMyRating] = useState<number>(0);
+  const [loadingMyRating, setLoadingMyRating] = useState<boolean>(true);
+  const [savingRating, setSavingRating] = useState<boolean>(false);
 
   useEffect(() => {
     const load = async () => {
@@ -101,21 +122,29 @@ export default function ShakeDetailsScreen() {
 
           if (snap.exists()) {
             const data = snap.data() as any;
+
             const milk = data.milkshakePrice ?? null;
             const thick = data.thickshakePrice ?? null;
-            const rating = data.rating ?? null;
+
+            // legacy field (if you ever had it)
+            const legacyRating = data.rating ?? null;
+
+            // ✅ new aggregate fields from function
+            const ratingAverage = data.ratingAverage ?? null;
+            const ratingCount = data.ratingCount ?? null;
 
             const fsShop: Shop = {
               id: snap.id,
               name: data.name ?? 'Unknown shop',
               area: undefined,
               address: data.address ?? '',
-              rating,
+              rating: legacyRating,
+              ratingAverage,
+              ratingCount,
               milkshakePrice: milk,
               thickshakePrice: thick,
               latitude: data.latitude ?? null,
               longitude: data.longitude ?? null,
-              // Later we will replace this with real uploaded photos
               images: [DEFAULT_IMAGE],
             };
 
@@ -137,6 +166,48 @@ export default function ShakeDetailsScreen() {
 
     load();
   }, [id]);
+
+  // Load "my rating" once we know the shop + user
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadMyRating = async () => {
+      if (!shop) return;
+
+      // Not logged in → nothing to load
+      if (!user?.uid) {
+        setMyRating(0);
+        setLoadingMyRating(false);
+        return;
+      }
+
+      try {
+        setLoadingMyRating(true);
+        const ratingRef = doc(db, `shops/${shop.id}/ratings/${user.uid}`);
+        const snap = await getDoc(ratingRef);
+
+        if (cancelled) return;
+
+        if (snap.exists()) {
+          const data = snap.data() as any;
+          setMyRating(Number(data.rating) || 0);
+        } else {
+          setMyRating(0);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setMyRating(0);
+        }
+      } finally {
+        if (!cancelled) setLoadingMyRating(false);
+      }
+    };
+
+    loadMyRating();
+    return () => {
+      cancelled = true;
+    };
+  }, [shop?.id, user?.uid]);
 
   const isFavourite = shop ? favourites.includes(shop.id) : false;
 
@@ -183,6 +254,47 @@ export default function ShakeDetailsScreen() {
     }
   };
 
+  const saveRating = async () => {
+    if (!shop) return;
+
+    if (!user?.uid) {
+      Alert.alert('Login required', 'Please log in to rate this shop.');
+      return;
+    }
+
+    if (myRating < 1 || myRating > 5) {
+      Alert.alert('Pick a rating', 'Please select 1–5 stars.');
+      return;
+    }
+
+    try {
+      setSavingRating(true);
+
+      // docId = uid, so each user has one rating per shop
+      const ratingRef = doc(db, `shops/${shop.id}/ratings/${user.uid}`);
+
+      await setDoc(
+        ratingRef,
+        {
+          uid: user.uid,
+          rating: myRating,
+          createdAt: Timestamp.now(),
+        },
+        { merge: true }
+      );
+
+      Alert.alert('Saved', 'Your rating has been saved.');
+    } catch (e: any) {
+      Alert.alert('Error', e?.message ?? 'Failed to save rating.');
+    } finally {
+      setSavingRating(false);
+    }
+  };
+
+  const canSaveRating = useMemo(() => {
+    return !!user?.uid && myRating >= 1 && myRating <= 5 && !savingRating;
+  }, [user?.uid, myRating, savingRating]);
+
   if (loading) {
     return (
       <SafeAreaView style={styles.screen}>
@@ -221,6 +333,17 @@ export default function ShakeDetailsScreen() {
   }
   const priceLine = priceLineParts.join(', ');
 
+  // Prefer function-driven aggregate rating
+  const displayRating =
+    typeof shop.ratingAverage === 'number'
+      ? shop.ratingAverage
+      : typeof shop.rating === 'number'
+        ? shop.rating
+        : null;
+
+  const displayRatingCount =
+    typeof shop.ratingCount === 'number' ? shop.ratingCount : null;
+
   return (
     <SafeAreaView style={styles.screen}>
       {/* Back button */}
@@ -258,7 +381,8 @@ export default function ShakeDetailsScreen() {
               {shop.area && <Text style={styles.area}>{shop.area}</Text>}
               {shop.address && <Text style={styles.address}>{shop.address}</Text>}
             </View>
-            {shop.rating != null && (
+
+            {displayRating != null && (
               <View style={styles.ratingPill}>
                 <Ionicons
                   name="star"
@@ -266,7 +390,8 @@ export default function ShakeDetailsScreen() {
                   color={theme.text.onBrand}
                 />
                 <Text style={styles.ratingPillText}>
-                  {shop.rating.toFixed(1)}
+                  {displayRating.toFixed(1)}
+                  {displayRatingCount != null ? ` (${displayRatingCount})` : ''}
                 </Text>
               </View>
             )}
@@ -304,6 +429,54 @@ export default function ShakeDetailsScreen() {
               />
               <Text style={styles.directionsText}>Get directions</Text>
             </TouchableOpacity>
+          </View>
+
+          {/* ⭐ Rate this shop */}
+          <View style={styles.rateBox}>
+            <Text style={styles.rateTitle}>Rate this shop</Text>
+
+            {!user?.uid ? (
+              <Text style={styles.rateHint}>Log in to leave a rating.</Text>
+            ) : loadingMyRating ? (
+              <View style={{ marginTop: 10 }}>
+                <ActivityIndicator />
+              </View>
+            ) : (
+              <>
+                <View style={styles.starsRow}>
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <TouchableOpacity
+                      key={n}
+                      onPress={() => setMyRating(n)}
+                      activeOpacity={0.8}
+                      style={styles.starTap}
+                    >
+                      <Ionicons
+                        name={n <= myRating ? 'star' : 'star-outline'}
+                        size={26}
+                        color={theme.text.primary}
+                      />
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                <TouchableOpacity
+                  onPress={saveRating}
+                  disabled={!canSaveRating}
+                  activeOpacity={0.85}
+                  style={[
+                    styles.saveRatingButton,
+                    !canSaveRating && { opacity: 0.5 },
+                  ]}
+                >
+                  {savingRating ? (
+                    <ActivityIndicator />
+                  ) : (
+                    <Text style={styles.saveRatingText}>Save rating</Text>
+                  )}
+                </TouchableOpacity>
+              </>
+            )}
           </View>
 
           <View style={styles.comingSoonContainer}>
@@ -458,6 +631,48 @@ const styles = StyleSheet.create({
     color: theme.text.onDark,
     fontSize: 16,
     fontWeight: '600',
+  },
+
+  // ⭐ rating box
+  rateBox: {
+    marginTop: 10,
+    padding: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: theme.surface.border,
+    backgroundColor: theme.surface.card,
+  },
+  rateTitle: {
+    color: theme.text.primary,
+    fontWeight: '900',
+    fontSize: 16,
+  },
+  rateHint: {
+    marginTop: 6,
+    color: theme.text.secondary,
+    fontWeight: '600',
+  },
+  starsRow: {
+    flexDirection: 'row',
+    marginTop: 10,
+  },
+  starTap: {
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+    marginRight: 6,
+  },
+  saveRatingButton: {
+    marginTop: 12,
+    height: 48,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: theme.controls.buttonPrimaryBg,
+  },
+  saveRatingText: {
+    color: theme.text.onBrand,
+    fontWeight: '900',
+    fontSize: 16,
   },
 
   comingSoonContainer: {

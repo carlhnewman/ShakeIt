@@ -11,7 +11,6 @@ import {
   FlatList,
   Image,
   Modal,
-  Pressable,
   SafeAreaView,
   StyleSheet,
   Text,
@@ -24,7 +23,24 @@ import { useExploreHighlight } from '../../context/ExploreHighlightContext';
 import { db } from '../../firebase';
 import { logoutUser } from '../../hooks/authHelpers';
 
+// ✅ ADD THIS (make sure you created: /utils/seedCoreShops.ts)
+import { seedCoreShopsIfMissing } from '../../utils/seedCoreShops';
+
 const DEFAULT_IMAGE = require('../../assets/images/defaultshake.png');
+
+// ✅ NEW: map core shop ids -> bundled images (safe static require)
+const getShopImage = (id: string) => {
+  switch (id) {
+    case '1':
+      return require('../../assets/images/captainmorgans.png');
+    case '2':
+      return require('../../assets/images/tepoicafe.png');
+    case '3':
+      return require('../../assets/images/hotbreadshop.png');
+    default:
+      return DEFAULT_IMAGE;
+  }
+};
 
 type BaseShop = {
   id: string;
@@ -33,8 +49,6 @@ type BaseShop = {
   latitude: number;
   longitude: number;
   image: any;
-  // FUTURE: maintained server-side (e.g. Cloud Function)
-  // “how much did the average rating move in the last 24h?”
   ratingDelta24h?: number | null;
 };
 
@@ -75,6 +89,27 @@ type NearestShop = BaseShop & {
 
 const SHAKE_OF_DAY_RADIUS_KM = 10;
 
+// ✅ DEV SWITCH: set to false later to make walkthrough only show once
+const FORCE_WALKTHROUGH_EVERY_TIME = true;
+
+const WALKTHROUGH_STEPS = [
+  {
+    title: 'Add a shake',
+    body: 'Tap the + button to add a new shake and help other people find the best spots.',
+    key: 'add',
+  },
+  {
+    title: 'Explore nearby',
+    body: 'Use the Explore tab to see shakes around you and get directions.',
+    key: 'explore',
+  },
+  {
+    title: 'Save favourites',
+    body: 'Tap the heart to save favourites so you can find them fast later.',
+    key: 'favourites',
+  },
+] as const;
+
 // Simple haversine distance in km
 function distanceKm(
   lat1: number,
@@ -96,6 +131,8 @@ function distanceKm(
   return R * c;
 }
 
+const HEADER_HEIGHT = 60; // matches styles.header.height
+
 const HomeScreen = () => {
   const router = useRouter();
   const { user, loading } = useAuth();
@@ -111,13 +148,18 @@ const HomeScreen = () => {
 
   const scaleAnim = useRef(new Animated.Value(1)).current;
 
-  const walkthroughTapOverride = () => {
-    if (walkthroughStep < 3) {
-      handlePress();
-    }
-  };
+  // ✅ Seed core shops into Firestore (safe to run multiple times because merge: true)
+  useEffect(() => {
+    (async () => {
+      try {
+        await seedCoreShopsIfMissing();
+      } catch (e) {
+        console.warn('seedCoreShopsIfMissing failed:', e);
+      }
+    })();
+  }, []);
 
-  // Pulsing “Add shake” icon during walkthrough
+  // Pulsing “Add shake” icon during walkthrough (step 0)
   useEffect(() => {
     if (walkthroughStep === 0 && showWalkthrough) {
       Animated.loop(
@@ -141,10 +183,16 @@ const HomeScreen = () => {
     }
   }, [walkthroughStep, showWalkthrough, scaleAnim]);
 
-  // Walkthrough show/hide
+  // ✅ Walkthrough show/hide
   useEffect(() => {
     const init = async () => {
       const hasSeen = await AsyncStorage.getItem('hasSeenWalkthrough');
+
+      if (FORCE_WALKTHROUGH_EVERY_TIME) {
+        setShowWalkthrough(true);
+        setWalkthroughStep(0);
+        return;
+      }
 
       if (!user && hasSeen !== 'true') {
         setShowWalkthrough(true);
@@ -160,14 +208,11 @@ const HomeScreen = () => {
     }
   }, [user, loading]);
 
-  // Load 3 nearest shops (core + cloud) and compute Shake of the Day.
-  // ratingDelta24h is expected to be maintained in Firestore later.
+  // Load 3 nearest shops and compute Shake of the Day
   useEffect(() => {
     const loadNearest = async () => {
       try {
-        // 1) Location permission + current position
-        const { status } =
-          await Location.requestForegroundPermissionsAsync();
+        const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted') {
           console.log('Location permission not granted');
           return;
@@ -177,15 +222,12 @@ const HomeScreen = () => {
         const userLat = loc.coords.latitude;
         const userLon = loc.coords.longitude;
 
-        // 2) Load cloud shops from Firestore
         const snap = await getDocs(collection(db, 'shops'));
 
         const cloud: BaseShop[] = snap.docs
           .map(doc => {
             const data = doc.data() as any;
 
-            // FUTURE: when you wire Google Places / geocoding, make sure
-            // you write latitude & longitude onto each shop document.
             const lat =
               typeof data.latitude === 'number'
                 ? data.latitude
@@ -199,10 +241,7 @@ const HomeScreen = () => {
                 ? Number(data.longitude)
                 : null;
 
-            if (lat == null || lon == null) {
-              // No coords yet → can’t use for “nearest” logic
-              return null;
-            }
+            if (lat == null || lon == null) return null;
 
             const rating =
               typeof data.rating === 'number'
@@ -224,38 +263,29 @@ const HomeScreen = () => {
               rating: rating ?? null,
               latitude: lat,
               longitude: lon,
-              image: DEFAULT_IMAGE, // until real photos are wired in
+              // ✅ CHANGED: use real bundled image for core ids, default for others
+              image: getShopImage(doc.id),
               ratingDelta24h: delta,
             } as BaseShop;
           })
           .filter(Boolean) as BaseShop[];
 
-        // 3) Combine core + cloud and compute distance
-        const all: BaseShop[] = [...CORE_SHOPS, ...cloud];
+        // ✅ FIX: dedupe by id (Firestore wins if same id as CORE_SHOPS)
+        const merged = new Map<string, BaseShop>();
+        CORE_SHOPS.forEach(s => merged.set(s.id, s));
+        cloud.forEach(s => merged.set(s.id, s));
+        const all: BaseShop[] = Array.from(merged.values());
 
-        if (!all.length) {
-          return;
-        }
+        if (!all.length) return;
 
         const withDistance: NearestShop[] = all.map(shop => ({
           ...shop,
-          distanceKm: distanceKm(
-            userLat,
-            userLon,
-            shop.latitude,
-            shop.longitude,
-          ),
+          distanceKm: distanceKm(userLat, userLon, shop.latitude, shop.longitude),
         }));
 
-        // Sort by distance and keep the closest 3 for the list
         withDistance.sort((a, b) => a.distanceKm - b.distanceKm);
         setNearestShops(withDistance.slice(0, 3));
 
-        // 4) Shake of the Day logic:
-        //    - Look only at shops within 10 km.
-        //    - If any have positive ratingDelta24h, pick the biggest.
-        //    - Otherwise, pick the highest-rated within 10 km.
-        //    - If literally nothing in 10 km, fall back to best overall.
         const withinRadius = withDistance.filter(
           s => s.distanceKm <= SHAKE_OF_DAY_RADIUS_KM,
         );
@@ -268,14 +298,12 @@ const HomeScreen = () => {
           );
 
           if (positiveDelta.length > 0) {
-            // Biggest jump in last 24h within 10 km
             top = positiveDelta.reduce((best, current) => {
               const bestDelta = best.ratingDelta24h ?? 0;
               const currentDelta = current.ratingDelta24h ?? 0;
               return currentDelta > bestDelta ? current : best;
             });
           } else {
-            // No change → highest-rated within 10 km
             const rated = withinRadius.filter(s => s.rating != null);
             const pool = rated.length ? rated : withinRadius;
             top = pool.reduce((best, current) => {
@@ -285,7 +313,6 @@ const HomeScreen = () => {
             });
           }
         } else {
-          // No shops in 10 km → fall back to best overall
           const ratedOverall = withDistance.filter(s => s.rating != null);
           const pool = ratedOverall.length ? ratedOverall : withDistance;
           top = pool.reduce((best, current) => {
@@ -305,29 +332,33 @@ const HomeScreen = () => {
   }, []);
 
   const finishWalkthrough = async () => {
-    await AsyncStorage.setItem('hasSeenWalkthrough', 'true');
+    if (!FORCE_WALKTHROUGH_EVERY_TIME) {
+      await AsyncStorage.setItem('hasSeenWalkthrough', 'true');
+    }
     setShowWalkthrough(false);
     setWalkthroughStep(3);
   };
 
-  const handlePress = () => {
+  // ✅ FIX: final button goes straight to /login (no intermediate modal)
+  const handleNextWalkthrough = async () => {
     if (walkthroughStep === 1) {
       setShowExploreHighlight(true);
     }
 
-    if (walkthroughStep === 2) {
-      finishWalkthrough();
-      setShowLoginModal(true);
+    const isLastStep = walkthroughStep >= WALKTHROUGH_STEPS.length - 1;
+
+    if (isLastStep) {
+      await finishWalkthrough();
+
+      if (!user) {
+        // Go straight to login (your login screen can still offer Sign Up)
+        router.push('/login');
+      }
+
       return;
     }
 
-    if (walkthroughStep < 2) {
-      setWalkthroughStep(prev => prev + 1);
-    }
-  };
-
-  const handleSkip = () => {
-    finishWalkthrough();
+    setWalkthroughStep(prev => prev + 1);
   };
 
   const handleLogout = async () => {
@@ -339,32 +370,83 @@ const HomeScreen = () => {
     }
   };
 
-  // If we have computed nearest shops, use them.
-  // Otherwise fall back to core shops so the screen isn’t empty.
   const listData: BaseShop[] =
     nearestShops.length > 0 ? nearestShops : CORE_SHOPS;
 
+  const step =
+    WALKTHROUGH_STEPS[
+      Math.min(walkthroughStep, WALKTHROUGH_STEPS.length - 1)
+    ];
+
+  const renderStepVisual = () => {
+    if (step.key === 'add') {
+      // ✅ FIX: Only show the Add Shake visual (no Profile chip)
+      return (
+        <View style={styles.visualRowCentered}>
+          <View style={styles.visualChip}>
+            <View style={styles.visualCircle}>
+              <Ionicons name="add" size={18} color={theme.text.onBrand} />
+            </View>
+            <Text style={styles.visualLabel}>Add Shake</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (step.key === 'explore') {
+      return (
+        <View style={styles.tabPreviewRow}>
+          <View style={styles.tabPreviewItem}>
+            <Ionicons name="home-outline" size={24} color={theme.text.muted} />
+            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>
+              Home
+            </Text>
+          </View>
+
+          <View style={styles.tabPreviewItem}>
+            <Ionicons name="map" size={24} color={theme.text.primary} />
+            <Text style={[styles.tabPreviewText, { color: theme.text.primary }]}>
+              Explore
+            </Text>
+          </View>
+
+          <View style={styles.tabPreviewItem}>
+            <Ionicons name="heart-outline" size={24} color={theme.text.muted} />
+            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>
+              Favourites
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
+    // ✅ FIX: favourites step should be ONE centred chip (no “Saved list”)
+    return (
+      <View style={styles.visualRowCentered}>
+        <View style={styles.visualChip}>
+          <View style={styles.visualCircle}>
+            <Ionicons name="heart" size={18} color={theme.text.onBrand} />
+          </View>
+          <Text style={styles.visualLabel}>Favourites</Text>
+        </View>
+      </View>
+    );
+  };
+
   return (
     <>
-      {showWalkthrough && walkthroughStep < 3 && (
-        <TouchableOpacity onPress={handleSkip} style={styles.skipButton}>
-          <Text style={styles.skipButtonText}>Skip</Text>
-        </TouchableOpacity>
-      )}
-
       <SafeAreaView style={styles.container}>
         {/* HEADER BAR */}
         <View style={styles.header}>
           {/* Left: Login/Profile */}
           <TouchableOpacity
             onPress={() => {
-              if (!user) {
-                setShowLoginModal(true);
-              } else {
-                setProfileMenuVisible(prev => !prev);
-              }
+              if (showWalkthrough) return;
+              if (!user) setShowLoginModal(true);
+              else setProfileMenuVisible(prev => !prev);
             }}
             style={styles.headerIconButton}
+            activeOpacity={0.8}
           >
             <Ionicons
               name={user ? 'person' : 'person-outline'}
@@ -374,43 +456,35 @@ const HomeScreen = () => {
           </TouchableOpacity>
 
           {/* Right: Add Shake */}
-          <Pressable
-            onPress={() => router.push('/add-shake')}
+          <TouchableOpacity
+            onPress={() => !showWalkthrough && router.push('/add-shake')}
             style={[styles.headerIconButton, styles.headerAddButton]}
+            activeOpacity={0.8}
           >
             <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
               <Ionicons name="add" size={22} color={theme.text.onBrand} />
             </Animated.View>
-          </Pressable>
+          </TouchableOpacity>
         </View>
 
         {/* MAIN CONTENT */}
-        <Pressable
-          style={{ flex: 1 }}
-          onPress={
-            showWalkthrough && walkthroughStep < 3
-              ? walkthroughTapOverride
-              : undefined
-          }
-        >
-          {/* ✅ NEW SHAKE-OF-THE-DAY IMAGE BANNER */}
+        <View style={{ flex: 1 }}>
+          {/* Shake of the Day banner */}
           {shakeOfTheDay && (
             <TouchableOpacity
               style={styles.shakeOfDayBanner}
               activeOpacity={0.9}
-              onPress={() => router.push(`/shake/${shakeOfTheDay.id}`)}
+              onPress={() =>
+                !showWalkthrough && router.push(`/shake/${shakeOfTheDay.id}`)
+              }
             >
               <Image
                 source={shakeOfTheDay.image}
                 style={styles.shakeOfDayImage}
               />
-
               <View style={styles.shakeOfDayOverlay}>
                 <Text style={styles.shakeOfDayLabel}>Shake of the Day</Text>
-
-                <Text style={styles.shakeOfDayName}>
-                  {shakeOfTheDay.name}
-                </Text>
+                <Text style={styles.shakeOfDayName}>{shakeOfTheDay.name}</Text>
 
                 <View style={styles.topFeatureMetaRow}>
                   {shakeOfTheDay.rating != null && (
@@ -437,7 +511,10 @@ const HomeScreen = () => {
             renderItem={({ item }) => (
               <TouchableOpacity
                 style={styles.card}
-                onPress={() => router.push(`/shake/${item.id}`)}
+                onPress={() =>
+                  !showWalkthrough && router.push(`/shake/${item.id}`)
+                }
+                activeOpacity={0.85}
               >
                 <Image source={item.image} style={styles.image} />
                 <Text style={styles.name}>{item.name}</Text>
@@ -447,36 +524,61 @@ const HomeScreen = () => {
               </TouchableOpacity>
             )}
           />
-
-          {showWalkthrough && walkthroughStep === 0 && (
-            <View style={styles.speechBubble}>
-              <Text style={styles.popupText}>Tap here to add a shake!</Text>
-            </View>
-          )}
-
-          {showWalkthrough && walkthroughStep === 1 && (
-            <>
-              <View style={styles.explorePopup}>
-                <Text style={styles.popupText}>Explore shakes near you!</Text>
-              </View>
-              <View style={styles.exploreTriangle} />
-            </>
-          )}
-
-          {showWalkthrough && walkthroughStep === 2 && (
-            <>
-              <View style={styles.favoritesPopup}>
-                <Text style={styles.popupText}>
-                  Add favourites and view them here.
-                </Text>
-              </View>
-              <View style={styles.favoritesTriangle} />
-            </>
-          )}
-        </Pressable>
+        </View>
       </SafeAreaView>
 
-      {/* Login Modal */}
+      {/* ✅ Walkthrough Modal */}
+      <Modal
+        transparent
+        animationType="fade"
+        visible={showWalkthrough && walkthroughStep < 3}
+        onRequestClose={() => finishWalkthrough()}
+      >
+        <View style={styles.walkthroughModalOverlay}>
+          <View style={styles.walkthroughCard}>
+            <Text style={styles.walkthroughTitle}>{step.title}</Text>
+            <Text style={styles.walkthroughBody}>{step.body}</Text>
+
+            {renderStepVisual()}
+
+            <View style={styles.walkthroughDotsRow}>
+              {WALKTHROUGH_STEPS.map((_, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.walkthroughDot,
+                    i === walkthroughStep && styles.walkthroughDotActive,
+                  ]}
+                />
+              ))}
+            </View>
+
+            <TouchableOpacity
+              style={styles.walkthroughNextButton}
+              onPress={handleNextWalkthrough}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.walkthroughNextText}>
+                {walkthroughStep >= WALKTHROUGH_STEPS.length - 1
+                  ? !user
+                    ? 'Login / Sign up'
+                    : 'Done'
+                  : 'Next'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() => finishWalkthrough()}
+              activeOpacity={0.8}
+              style={{ marginTop: 10 }}
+            >
+              <Text style={styles.walkthroughNotNow}>Not now</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Login Modal (still used when tapping profile icon while logged out) */}
       <Modal
         transparent
         animationType="fade"
@@ -504,8 +606,8 @@ const HomeScreen = () => {
                 ]}
                 onPress={() => {
                   setShowLoginModal(false);
-                  router.push('/login');
                   finishWalkthrough();
+                  router.push('/login');
                 }}
               >
                 <Text style={styles.authButtonText}>Login</Text>
@@ -520,8 +622,8 @@ const HomeScreen = () => {
                 ]}
                 onPress={() => {
                   setShowLoginModal(false);
-                  router.push('/signup');
                   finishWalkthrough();
+                  router.push('/signup');
                 }}
               >
                 <Text style={styles.authButtonText}>Sign Up</Text>
@@ -539,18 +641,14 @@ const HomeScreen = () => {
         onRequestClose={() => setProfileMenuVisible(false)}
       >
         <View style={styles.profileOverlay}>
-          {/* Backdrop only BELOW the header so the icon stays tappable */}
           <TouchableOpacity
             style={styles.profileBackdrop}
             activeOpacity={1}
             onPress={() => setProfileMenuVisible(false)}
           />
-          {/* Menu dropping down from the icon */}
           <View style={styles.profileMenu}>
             <Text style={styles.profileTitle}>Profile</Text>
-            {user?.email && (
-              <Text style={styles.profileEmail}>{user.email}</Text>
-            )}
+            {user?.email && <Text style={styles.profileEmail}>{user.email}</Text>}
 
             <TouchableOpacity
               style={[styles.profileButton, { marginTop: 10 }]}
@@ -559,6 +657,16 @@ const HomeScreen = () => {
               <Text style={styles.profileButtonText}>
                 Preferences (coming soon)
               </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.profileButton, { marginTop: 8 }]}
+              onPress={() => {
+                setProfileMenuVisible(false);
+                router.push('../privacy');
+              }}
+            >
+              <Text style={styles.profileButtonText}>Privacy Policy</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -585,8 +693,6 @@ const HomeScreen = () => {
 };
 
 export default HomeScreen;
-
-const HEADER_HEIGHT = 60; // matches styles.header.height
 
 const styles = StyleSheet.create({
   container: {
@@ -621,7 +727,7 @@ const styles = StyleSheet.create({
     borderColor: theme.brand.primary,
   },
 
-  /* 🔥 Shake of the Day banner styles */
+  /* Shake of the Day banner */
   shakeOfDayBanner: {
     height: 180,
     marginHorizontal: 12,
@@ -675,7 +781,6 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
 
-  // Meta row reused inside overlay
   topFeatureMetaRow: {
     flexDirection: 'row',
     marginTop: 6,
@@ -710,94 +815,145 @@ const styles = StyleSheet.create({
     color: theme.text.secondary,
   },
 
-  speechBubble: {
-    position: 'absolute',
-    top: 110,
-    right: 20,
-    backgroundColor: theme.walkthrough.bubbleBg,
-    padding: 12,
-    borderRadius: 10,
-    elevation: 5,
-    borderColor: theme.walkthrough.highlightBorder,
-    borderWidth: 2,
-  },
-
-  popupText: {
-    fontSize: 16,
-    fontWeight: 'bold',
-    color: theme.walkthrough.bubbleText,
-  },
-
-  skipButton: {
-    position: 'absolute',
-    top: 15,
-    left: 20,
-    zIndex: 10,
-  },
-
-  skipButtonText: {
-    color: theme.text.primary,
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-
-  explorePopup: {
-    backgroundColor: theme.walkthrough.bubbleBg,
-    padding: 12,
-    borderRadius: 10,
-    elevation: 5,
-    borderColor: theme.walkthrough.highlightBorder,
-    borderWidth: 2,
-    width: 150,
+  /* Walkthrough modal */
+  walkthroughModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center',
     alignItems: 'center',
-    position: 'absolute',
-    bottom: 20,
-    left: '50%',
-    transform: [{ translateX: -75 }],
+    paddingHorizontal: 14,
   },
 
-  exploreTriangle: {
-    position: 'absolute',
-    bottom: 10,
-    left: '50%',
-    transform: [{ translateX: -10 }],
-    width: 0,
-    height: 0,
-    borderLeftWidth: 10,
-    borderRightWidth: 10,
-    borderTopWidth: 10,
-    borderStyle: 'solid',
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
-    borderTopColor: theme.walkthrough.highlightBorder,
+  walkthroughCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: theme.surface.card,
+    borderRadius: 18,
+    padding: 22,
+    borderWidth: 1,
+    borderColor: theme.surface.border,
   },
 
-  favoritesPopup: {
-    position: 'absolute',
-    bottom: 20,
-    right: 20,
-    width: 180,
-    padding: 12,
-    borderRadius: 10,
-    backgroundColor: theme.walkthrough.bubbleBg,
-    elevation: 5,
-    borderColor: theme.walkthrough.highlightBorder,
-    borderWidth: 2,
+  walkthroughTitle: {
+    fontSize: 26,
+    fontWeight: '900',
+    color: theme.text.primary,
+    marginBottom: 10,
   },
 
-  favoritesTriangle: {
-    position: 'absolute',
-    bottom: 10,
-    right: 43,
-    width: 0,
-    height: 0,
-    borderLeftWidth: 10,
-    borderRightWidth: 10,
-    borderTopWidth: 10,
-    borderStyle: 'solid',
-    borderLeftColor: 'transparent',
-    borderRightColor: 'transparent',
-    borderTopColor: theme.walkthrough.highlightBorder,
+  walkthroughBody: {
+    fontSize: 16,
+    lineHeight: 22,
+    color: theme.text.secondary,
+  },
+
+  visualRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+    alignItems: 'center',
+  },
+
+  // ✅ used when there is only ONE chip (Add step + Favourites step)
+  visualRowCentered: {
+    flexDirection: 'row',
+    marginTop: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  visualChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: theme.surface.sheet,
+    borderWidth: 1,
+    borderColor: theme.surface.border,
+  },
+
+  visualCircle: {
+    width: 34,
+    height: 34,
+    borderRadius: 999,
+    backgroundColor: theme.brand.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  visualLabel: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: theme.text.primary,
+  },
+
+  tabPreviewRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: theme.surface.sheet,
+    borderWidth: 1,
+    borderColor: theme.surface.border,
+  },
+
+  tabPreviewItem: {
+    alignItems: 'center',
+    gap: 6,
+    width: 90,
+  },
+
+  tabPreviewText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  walkthroughDotsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 16,
+    marginBottom: 16,
+
+    // ✅ FIX: centre the dots
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: '100%',
+  },
+
+  walkthroughDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 999,
+    backgroundColor: theme.surface.border,
+  },
+
+  walkthroughDotActive: {
+    backgroundColor: theme.brand.primary,
+  },
+
+  walkthroughNextButton: {
+    marginTop: 2,
+    backgroundColor: theme.brand.primary,
+    borderRadius: 999,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+
+  walkthroughNextText: {
+    color: theme.text.onBrand,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+
+  walkthroughNotNow: {
+    textAlign: 'center',
+    color: theme.text.muted,
+    fontSize: 14,
+    fontWeight: '700',
   },
 
   modalBackground: {
@@ -860,7 +1016,6 @@ const styles = StyleSheet.create({
     backgroundColor: theme.surface.overlay,
   },
 
-  // Backdrop only under the header, so the icon area stays “click-through”
   profileBackdrop: {
     position: 'absolute',
     top: HEADER_HEIGHT,
@@ -871,8 +1026,8 @@ const styles = StyleSheet.create({
 
   profileMenu: {
     position: 'absolute',
-    top: HEADER_HEIGHT + 50, // drops from bottom of icon
-    left: 20, // lined up with icon
+    top: HEADER_HEIGHT + 50,
+    left: 20,
     backgroundColor: theme.surface.card,
     borderRadius: 10,
     padding: 12,

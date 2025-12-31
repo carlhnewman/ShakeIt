@@ -22,48 +22,35 @@ import { collection, onSnapshot, orderBy, query } from 'firebase/firestore';
 import { theme } from '../../constants/colors';
 import { db } from '../../firebase';
 
-// --------------------
-// Local hard-coded shops (IDs now match home + detail screen)
-// --------------------
-const localMilkshakeShops = [
-  {
-    id: '1',
-    name: "Captain Morgan's",
-    latitude: -38.6704,
-    longitude: 178.0169,
-    rating: 4.5,
-    price: '$9 Thick Shake, $6.5 Milkshake',
-    image: require('../../assets/images/captainmorgans.png'),
-    area: 'Gisborne',
-  },
-  {
-    id: '2',
-    name: 'Te Poi Cafe',
-    latitude: -37.8724,
-    longitude: 175.8423,
-    rating: 4.5,
-    price: '$8 Thick Shake, $6 Milkshake',
-    image: require('../../assets/images/tepoicafe.png'),
-    area: 'Te Poi',
-  },
-  {
-    id: '3',
-    name: 'Hot Bread Shop Cafe',
-    latitude: -38.0118,
-    longitude: 177.2869,
-    rating: 4.0,
-    price: '$8 Thick Shake, $5.5 Milkshake',
-    image: require('../../assets/images/hotbreadshop.png'),
-    area: 'Ōpōtiki',
-  },
-];
+// ✅ ADD: default image + helper for core ids
+const DEFAULT_IMAGE = require('../../assets/images/defaultshake.png');
+
+const getShopImage = (id: string) => {
+  switch (id) {
+    case '1':
+      return require('../../assets/images/captainmorgans.png');
+    case '2':
+      return require('../../assets/images/tepoicafe.png');
+    case '3':
+      return require('../../assets/images/hotbreadshop.png');
+    default:
+      return DEFAULT_IMAGE;
+  }
+};
 
 // Type for shops coming from Firestore
 type CloudShop = {
   id: string;
   name: string;
   address?: string;
+
+  // legacy
   rating?: number | null;
+
+  // ✅ new aggregate fields updated by your Cloud Function
+  ratingAverage?: number | null;
+  ratingCount?: number | null;
+
   milkshakePrice?: number | null;
   thickshakePrice?: number | null;
   latitude?: number | null;
@@ -137,6 +124,22 @@ export default function ExploreScreen() {
                 : data.rating
                 ? Number(data.rating)
                 : null,
+
+            // ✅ aggregates (preferred)
+            ratingAverage:
+              typeof data.ratingAverage === 'number'
+                ? data.ratingAverage
+                : data.ratingAverage
+                ? Number(data.ratingAverage)
+                : null,
+
+            ratingCount:
+              typeof data.ratingCount === 'number'
+                ? data.ratingCount
+                : data.ratingCount
+                ? Number(data.ratingCount)
+                : null,
+
             milkshakePrice:
               typeof data.milkshakePrice === 'number'
                 ? data.milkshakePrice
@@ -178,17 +181,16 @@ export default function ExploreScreen() {
   // --------------------
   useFocusEffect(
     React.useCallback(() => {
-      // coming back to Explore (e.g. from /shake/[id])
       setSelectedShop(null);
       setMapKey(prev => prev + 1); // force MapView remount to clear selected marker
     }, []),
   );
 
   // --------------------
-  // Combine local + cloud into one list
+  // Firestore only (no local shops, no merge)
   // --------------------
   const allShops: DisplayShop[] = useMemo(() => {
-    const mappedCloud: DisplayShop[] = cloudShops.map(shop => {
+    return cloudShops.map(shop => {
       // Build a price string for display
       let priceText = '';
       if (shop.thickshakePrice != null && shop.milkshakePrice != null) {
@@ -217,16 +219,20 @@ export default function ExploreScreen() {
         name: shop.name,
         latitude: shop.latitude ?? null,
         longitude: shop.longitude ?? null,
-        rating: shop.rating != null ? shop.rating : 0,
+        rating:
+          shop.ratingAverage != null
+            ? shop.ratingAverage
+            : shop.rating != null
+            ? shop.rating
+            : 0,
         price: priceText,
-        image: require('../../assets/images/defaultshake.png'),
+        // ✅ CHANGED: core ids get real photos, others default
+        image: getShopImage(shop.id),
         area,
         address: shop.address,
         isCloud: true,
       };
     });
-
-    return [...localMilkshakeShops, ...mappedCloud];
   }, [cloudShops]);
 
   const toggleFavourite = async (id: string) => {
@@ -265,6 +271,12 @@ export default function ExploreScreen() {
     }
   };
 
+  // helper: close sheet AND reset marker selection
+  const closeSheetAndDeselect = () => {
+    setSelectedShop(null);
+    setMapKey(prev => prev + 1); // remount map so the pin shrinks back
+  };
+
   if (!location) {
     return (
       <View style={styles.loadingContainer}>
@@ -276,7 +288,7 @@ export default function ExploreScreen() {
   return (
     <View style={styles.container}>
       <MapView
-        key={mapKey} // <- remounts on focus to clear marker selection
+        key={mapKey} // <- remounts on focus or when we clear selection
         ref={ref => setMapRef(ref)}
         style={styles.map}
         initialRegion={{
@@ -303,6 +315,9 @@ export default function ExploreScreen() {
                 latitude: shop.latitude,
                 longitude: shop.longitude,
               }}
+              // iOS: fires when the marker is selected (big pin)
+              onSelect={() => setSelectedShop(shop)}
+              // Android / web (and harmless duplicate on iOS)
               onPress={() => setSelectedShop(shop)}
             />
           );
@@ -311,18 +326,14 @@ export default function ExploreScreen() {
 
       {/* Zoom to Me button */}
       <TouchableOpacity style={styles.zoomButton} onPress={zoomToUserLocation}>
-        <Ionicons
-          name="navigate"
-          size={32}
-          color={theme.text.primary}
-        />
+        <Ionicons name="navigate" size={32} color={theme.text.primary} />
       </TouchableOpacity>
 
       {/* Bottom sheet */}
       <Modal
         isVisible={!!selectedShop}
-        onBackdropPress={() => setSelectedShop(null)}
-        onSwipeComplete={() => setSelectedShop(null)}
+        onBackdropPress={closeSheetAndDeselect}
+        onSwipeComplete={closeSheetAndDeselect}
         swipeDirection="down"
         style={styles.bottomModal}
       >
@@ -344,11 +355,7 @@ export default function ExploreScreen() {
                   )}
                 </View>
                 <View style={styles.ratingPill}>
-                  <Ionicons
-                    name="star"
-                    size={16}
-                    color={theme.text.onBrand}
-                  />
+                  <Ionicons name="star" size={16} color={theme.text.onBrand} />
                   <Text style={styles.ratingPillText}>
                     {selectedShop.rating.toFixed(1)}
                   </Text>
@@ -363,8 +370,8 @@ export default function ExploreScreen() {
                   style={styles.infoButton}
                   onPress={() => {
                     const id = selectedShop.id;
-                    setSelectedShop(null);          // collapse sheet
-                    router.push(`/shake/${id}`);    // then navigate
+                    setSelectedShop(null); // collapse sheet
+                    router.push(`/shake/${id}`); // then navigate
                   }}
                 >
                   <Ionicons
@@ -401,11 +408,7 @@ export default function ExploreScreen() {
                   style={styles.directionsButton}
                   onPress={() => openMaps(selectedShop)}
                 >
-                  <Ionicons
-                    name="map"
-                    size={18}
-                    color={theme.text.onBrand}
-                  />
+                  <Ionicons name="map" size={18} color={theme.text.onBrand} />
                   <Text style={styles.directionsText}>Directions</Text>
                 </TouchableOpacity>
               </View>
