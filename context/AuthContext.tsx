@@ -12,27 +12,39 @@ import { auth } from '../firebase';
 type AuthContextType = {
   user: User | null;
   loading: boolean;
+  isAdmin: boolean;
 };
 
 const AuthContext = createContext<AuthContextType>({
   user: null,
   loading: true,
+  isAdmin: false,
 });
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
+      setUser(firebaseUser);
+
       if (firebaseUser) {
-        console.log('🔥 MY FIREBASE UID:', firebaseUser.uid);
-        console.log('🔥 MY EMAIL:', firebaseUser.email);
+        try {
+          // ✅ force refresh so admin claims update immediately
+          await firebaseUser.getIdToken(true);
+
+          const tokenResult = await firebaseUser.getIdTokenResult();
+
+          setIsAdmin(tokenResult.claims.admin === true);
+        } catch {
+          setIsAdmin(false);
+        }
       } else {
-        console.log('🔥 SIGNED OUT');
+        setIsAdmin(false);
       }
 
-      setUser(firebaseUser);
       setLoading(false);
     });
 
@@ -40,7 +52,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading }}>
+    <AuthContext.Provider value={{ user, loading, isAdmin }}>
       {children}
     </AuthContext.Provider>
   );

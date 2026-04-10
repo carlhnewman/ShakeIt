@@ -2,86 +2,77 @@
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
-import { useRouter } from 'expo-router';
-import { collection, getDocs } from 'firebase/firestore';
-import React, { useEffect, useRef, useState } from 'react';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { collection, onSnapshot, query, where } from 'firebase/firestore';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Animated,
   Easing,
   FlatList,
   Image,
   Modal,
-  SafeAreaView,
   StyleSheet,
   Text,
   TouchableOpacity,
-  View,
+  View
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme } from '../../constants/colors';
 import { useAuth } from '../../context/AuthContext';
 import { useExploreHighlight } from '../../context/ExploreHighlightContext';
 import { db } from '../../firebase';
 import { logoutUser } from '../../hooks/authHelpers';
 
-// ✅ ADD THIS (make sure you created: /utils/seedCoreShops.ts)
-import { seedCoreShopsIfMissing } from '../../utils/seedCoreShops';
+// ✅ preferences (units km/mi)
+import { DEFAULT_PREFS, getPreferences, Preferences } from '../../utils/preferences';
 
 const DEFAULT_IMAGE = require('../../assets/images/defaultshake.png');
 
-// ✅ NEW: map core shop ids -> bundled images (safe static require)
-const getShopImage = (id: string) => {
-  switch (id) {
-    case '1':
-      return require('../../assets/images/captainmorgans.png');
-    case '2':
-      return require('../../assets/images/tepoicafe.png');
-    case '3':
-      return require('../../assets/images/hotbreadshop.png');
-    default:
-      return DEFAULT_IMAGE;
-  }
+// ✅ Safe preview helper (only uses valid https URLs)
+const getPreviewImage = (previewPhotoUrl: string | null, fallback: any) => {
+  const url = typeof previewPhotoUrl === 'string' ? previewPhotoUrl.trim() : '';
+  if (url.startsWith('https://')) return { uri: url };
+  return fallback;
 };
+
+// ✅ Stable shop identity helper (used for dedupe/merge)
+const slugify = (s: string) =>
+  s
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+
+const makeShopKey = (name: string, lat: number, lon: number) =>
+  `${slugify(name)}|${lat.toFixed(5)}|${lon.toFixed(5)}`;
 
 type BaseShop = {
   id: string;
+
+  // stable identity for merging (dedupe by this)
+  shopKey: string;
+
   name: string;
+  address?: string;
+
+  // legacy / fallback
   rating: number | null;
+
+  // aggregate fields
+  ratingAverage?: number | null;
+  ratingCount?: number | null;
+
   latitude: number;
   longitude: number;
+
+  // approved-only preview image url stored on shops doc
+  previewPhotoUrl?: string | null;
+
+  // resolved image source (either {uri} or require())
   image: any;
+
   ratingDelta24h?: number | null;
 };
-
-// Core shops with real coordinates – used everywhere
-const CORE_SHOPS: BaseShop[] = [
-  {
-    id: '1',
-    name: "Captain Morgan's",
-    rating: 4.5,
-    latitude: -38.6704,
-    longitude: 178.0169,
-    image: require('../../assets/images/captainmorgans.png'),
-    ratingDelta24h: 0,
-  },
-  {
-    id: '2',
-    name: 'Te Poi Cafe',
-    rating: 4.5,
-    latitude: -37.8724,
-    longitude: 175.8423,
-    image: require('../../assets/images/tepoicafe.png'),
-    ratingDelta24h: 0,
-  },
-  {
-    id: '3',
-    name: 'Hot Bread Shop Cafe',
-    rating: 4.0,
-    latitude: -38.0118,
-    longitude: 177.2869,
-    image: require('../../assets/images/hotbreadshop.png'),
-    ratingDelta24h: 0,
-  },
-];
 
 type NearestShop = BaseShop & {
   distanceKm: number;
@@ -89,19 +80,23 @@ type NearestShop = BaseShop & {
 
 const SHAKE_OF_DAY_RADIUS_KM = 10;
 
-// ✅ DEV SWITCH: set to false later to make walkthrough only show once
-const FORCE_WALKTHROUGH_EVERY_TIME = true;
+// ✅ DEV SWITCH: set to false to make walkthrough show once (flip to true to force in dev)
+const FORCE_WALKTHROUGH_EVERY_TIME = false;
 
+// ✅ Versioned walkthrough key (bump to _v2 when you redesign walkthrough)
+const WALKTHROUGH_KEY = 'hasSeenWalkthrough_v1';
+
+// ✅ Walkthrough steps (re-ordered)
 const WALKTHROUGH_STEPS = [
-  {
-    title: 'Add a shake',
-    body: 'Tap the + button to add a new shake and help other people find the best spots.',
-    key: 'add',
-  },
   {
     title: 'Explore nearby',
     body: 'Use the Explore tab to see shakes around you and get directions.',
     key: 'explore',
+  },
+  {
+    title: 'Add a shake',
+    body: 'Tap the + button to add a new shake and help other people find the best spots.',
+    key: 'add',
   },
   {
     title: 'Save favourites',
@@ -111,12 +106,7 @@ const WALKTHROUGH_STEPS = [
 ] as const;
 
 // Simple haversine distance in km
-function distanceKm(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number,
-): number {
+function distanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const toRad = (deg: number) => (deg * Math.PI) / 180;
   const R = 6371; // Earth radius (km)
   const dLat = toRad(lat2 - lat1);
@@ -131,7 +121,6 @@ function distanceKm(
   return R * c;
 }
 
-const HEADER_HEIGHT = 60; // matches styles.header.height
 
 const HomeScreen = () => {
   const router = useRouter();
@@ -146,22 +135,49 @@ const HomeScreen = () => {
   const [nearestShops, setNearestShops] = useState<NearestShop[]>([]);
   const [shakeOfTheDay, setShakeOfTheDay] = useState<NearestShop | null>(null);
 
+  // ✅ preferences state (for km/mi)
+  const [prefs, setPrefs] = useState<Preferences>(DEFAULT_PREFS);
+
+  // ✅ live Firestore shops state
+  const [cloudShops, setCloudShops] = useState<BaseShop[]>([]);
+
+  // ✅ keep user location in state so we can recompute when it becomes available
+  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(
+    null,
+  );
+
   const scaleAnim = useRef(new Animated.Value(1)).current;
 
-  // ✅ Seed core shops into Firestore (safe to run multiple times because merge: true)
-  useEffect(() => {
-    (async () => {
-      try {
-        await seedCoreShopsIfMissing();
-      } catch (e) {
-        console.warn('seedCoreShopsIfMissing failed:', e);
-      }
-    })();
+  // ✅ focus-aware prefs reload (so km/mi updates immediately when coming back)
+  const loadPrefs = useCallback(async () => {
+    try {
+      const p = await getPreferences();
+      setPrefs(p);
+    } catch {
+      setPrefs(DEFAULT_PREFS);
+    }
   }, []);
 
-  // Pulsing “Add shake” icon during walkthrough (step 0)
+  useFocusEffect(
+    useCallback(() => {
+      loadPrefs();
+    }, [loadPrefs]),
+  );
+
+  // ✅ helper to format distance using prefs
+  const formatDistance = (km: number) => {
+  if (prefs.units === 'mi') {
+    const miles = km * 0.621371;
+    return `${miles.toFixed(1)} mi`;
+  }
+  return `${km.toFixed(1)} km`;
+};
+
+  // ✅ Pulse only during the “add” step (regardless of its index)
   useEffect(() => {
-    if (walkthroughStep === 0 && showWalkthrough) {
+    const stepKey = WALKTHROUGH_STEPS[walkthroughStep]?.key;
+
+    if (stepKey === 'add' && showWalkthrough) {
       Animated.loop(
         Animated.sequence([
           Animated.timing(scaleAnim, {
@@ -183,18 +199,20 @@ const HomeScreen = () => {
     }
   }, [walkthroughStep, showWalkthrough, scaleAnim]);
 
-  // ✅ Walkthrough show/hide
+  // ✅ Walkthrough show/hide (show once ever, regardless of login)
   useEffect(() => {
     const init = async () => {
-      const hasSeen = await AsyncStorage.getItem('hasSeenWalkthrough');
-
+      // ✅ If dev forcing, always show
       if (FORCE_WALKTHROUGH_EVERY_TIME) {
         setShowWalkthrough(true);
         setWalkthroughStep(0);
         return;
       }
 
-      if (!user && hasSeen !== 'true') {
+      const hasSeen = await AsyncStorage.getItem(WALKTHROUGH_KEY);
+
+      // ✅ Show only if they haven't seen it yet (regardless of login)
+      if (hasSeen !== 'true') {
         setShowWalkthrough(true);
         setWalkthroughStep(0);
       } else {
@@ -203,14 +221,15 @@ const HomeScreen = () => {
       }
     };
 
-    if (!loading) {
-      init();
-    }
-  }, [user, loading]);
+    if (!loading) init();
+  }, [loading]);
 
-  // Load 3 nearest shops and compute Shake of the Day
+  // ✅ keep location in state (and update as it becomes available)
   useEffect(() => {
-    const loadNearest = async () => {
+    let cancelled = false;
+    let sub: Location.LocationSubscription | null = null;
+
+    const initLocation = async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted') {
@@ -219,14 +238,51 @@ const HomeScreen = () => {
         }
 
         const loc = await Location.getCurrentPositionAsync({});
-        const userLat = loc.coords.latitude;
-        const userLon = loc.coords.longitude;
+        if (cancelled) return;
 
-        const snap = await getDocs(collection(db, 'shops'));
+        setUserLocation({
+          latitude: loc.coords.latitude,
+          longitude: loc.coords.longitude,
+        });
 
-        const cloud: BaseShop[] = snap.docs
-          .map(doc => {
-            const data = doc.data() as any;
+        // Optional: live updates while user moves (helps “closest 3” stay accurate)
+        sub = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            timeInterval: 5000,
+            distanceInterval: 50,
+          },
+          (p) => {
+            setUserLocation({
+              latitude: p.coords.latitude,
+              longitude: p.coords.longitude,
+            });
+          },
+        );
+      } catch (err) {
+        console.warn('Location init failed:', err);
+      }
+    };
+
+    initLocation();
+
+    return () => {
+      cancelled = true;
+      if (sub) sub.remove();
+    };
+  }, []);
+
+  // ✅ live Firestore listener (this is what makes Home refresh in real time)
+  useEffect(() => {
+    // ✅ Only show approved shops
+    const q = query(collection(db, 'shops'), where('approved', '==', true));
+
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const rows: BaseShop[] = snap.docs
+          .map((docSnap) => {
+            const data = docSnap.data() as any;
 
             const lat =
               typeof data.latitude === 'number'
@@ -234,6 +290,7 @@ const HomeScreen = () => {
                 : data.latitude
                 ? Number(data.latitude)
                 : null;
+
             const lon =
               typeof data.longitude === 'number'
                 ? data.longitude
@@ -243,7 +300,21 @@ const HomeScreen = () => {
 
             if (lat == null || lon == null) return null;
 
-            const rating =
+            const ratingCountRaw =
+              typeof data.ratingCount === 'number'
+                ? data.ratingCount
+                : data.ratingCount
+                ? Number(data.ratingCount)
+                : null;
+
+            const ratingAvgRaw =
+              typeof data.ratingAverage === 'number'
+                ? data.ratingAverage
+                : data.ratingAverage
+                ? Number(data.ratingAverage)
+                : null;
+
+            const legacyRatingRaw =
               typeof data.rating === 'number'
                 ? data.rating
                 : data.rating
@@ -257,91 +328,139 @@ const HomeScreen = () => {
                 ? Number(data.ratingDelta24h)
                 : 0;
 
+            const name = data.name ?? 'Unnamed shop';
+
+            const shopKey: string =
+              typeof data.shopKey === 'string' && data.shopKey.length > 0
+                ? data.shopKey
+                : makeShopKey(name, Number(lat), Number(lon));
+
+            const previewPhotoUrl: string | null =
+              typeof data.previewPhotoUrl === 'string' ? data.previewPhotoUrl : null;
+
+            const address: string | undefined =
+              typeof data.address === 'string' && data.address.trim().length > 0
+                ? data.address
+                : undefined;
+
+            const fallback = DEFAULT_IMAGE;
+
             return {
-              id: doc.id,
-              name: data.name ?? 'Unnamed shop',
-              rating: rating ?? null,
-              latitude: lat,
-              longitude: lon,
-              // ✅ CHANGED: use real bundled image for core ids, default for others
-              image: getShopImage(doc.id),
+              id: docSnap.id,
+              shopKey,
+              name,
+              address,
+
+              rating: legacyRatingRaw ?? null,
+              ratingAverage: ratingAvgRaw ?? null,
+              ratingCount: ratingCountRaw ?? null,
+
+              latitude: Number(lat),
+              longitude: Number(lon),
+
+              previewPhotoUrl,
+
+              image: getPreviewImage(previewPhotoUrl, fallback),
+
               ratingDelta24h: delta,
             } as BaseShop;
           })
           .filter(Boolean) as BaseShop[];
 
-        // ✅ FIX: dedupe by id (Firestore wins if same id as CORE_SHOPS)
-        const merged = new Map<string, BaseShop>();
-        CORE_SHOPS.forEach(s => merged.set(s.id, s));
-        cloud.forEach(s => merged.set(s.id, s));
-        const all: BaseShop[] = Array.from(merged.values());
+        setCloudShops(rows);
+      },
+      (err) => {
+        console.error('Home shops listener failed:', err);
+        setCloudShops([]);
+      },
+    );
 
-        if (!all.length) return;
-
-        const withDistance: NearestShop[] = all.map(shop => ({
-          ...shop,
-          distanceKm: distanceKm(userLat, userLon, shop.latitude, shop.longitude),
-        }));
-
-        withDistance.sort((a, b) => a.distanceKm - b.distanceKm);
-        setNearestShops(withDistance.slice(0, 3));
-
-        const withinRadius = withDistance.filter(
-          s => s.distanceKm <= SHAKE_OF_DAY_RADIUS_KM,
-        );
-
-        let top: NearestShop | null = null;
-
-        if (withinRadius.length) {
-          const positiveDelta = withinRadius.filter(
-            s => (s.ratingDelta24h ?? 0) > 0,
-          );
-
-          if (positiveDelta.length > 0) {
-            top = positiveDelta.reduce((best, current) => {
-              const bestDelta = best.ratingDelta24h ?? 0;
-              const currentDelta = current.ratingDelta24h ?? 0;
-              return currentDelta > bestDelta ? current : best;
-            });
-          } else {
-            const rated = withinRadius.filter(s => s.rating != null);
-            const pool = rated.length ? rated : withinRadius;
-            top = pool.reduce((best, current) => {
-              const bestRating = best.rating ?? 0;
-              const currentRating = current.rating ?? 0;
-              return currentRating > bestRating ? current : best;
-            });
-          }
-        } else {
-          const ratedOverall = withDistance.filter(s => s.rating != null);
-          const pool = ratedOverall.length ? ratedOverall : withDistance;
-          top = pool.reduce((best, current) => {
-            const bestRating = best.rating ?? 0;
-            const currentRating = current.rating ?? 0;
-            return currentRating > bestRating ? current : best;
-          });
-        }
-
-        setShakeOfTheDay(top);
-      } catch (err) {
-        console.error('Error loading nearest shops / Shake of the Day:', err);
-      }
-    };
-
-    loadNearest();
+    return () => unsub();
   }, []);
 
-  const finishWalkthrough = async () => {
-    if (!FORCE_WALKTHROUGH_EVERY_TIME) {
-      await AsyncStorage.setItem('hasSeenWalkthrough', 'true');
+  const ratingFor = useCallback((s: BaseShop) => {
+    if (typeof s.ratingAverage === 'number') return s.ratingAverage;
+    if (typeof s.rating === 'number') return s.rating;
+    return null;
+  }, []);
+
+  // ✅ recompute nearest + Shake of the Day whenever shops OR location changes
+  useEffect(() => {
+    if (!userLocation) {
+      setNearestShops([]);
+      setShakeOfTheDay(null);
+      return;
     }
+
+    if (!cloudShops.length) {
+      setNearestShops([]);
+      setShakeOfTheDay(null);
+      return;
+    }
+
+    const withDistance: NearestShop[] = cloudShops
+      .filter((s) => s.latitude != null && s.longitude != null)
+      .map((shop) => ({
+        ...shop,
+        distanceKm: distanceKm(
+          userLocation.latitude,
+          userLocation.longitude,
+          shop.latitude,
+          shop.longitude,
+        ),
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+
+    setNearestShops(withDistance.slice(0, 3));
+
+    const withinRadius = withDistance.filter((s) => s.distanceKm <= SHAKE_OF_DAY_RADIUS_KM);
+
+    let top: NearestShop | null = null;
+
+    if (withinRadius.length) {
+      const positiveDelta = withinRadius.filter((s) => (s.ratingDelta24h ?? 0) > 0);
+
+      if (positiveDelta.length > 0) {
+        top = positiveDelta.reduce((best, current) => {
+          const bestDelta = best.ratingDelta24h ?? 0;
+          const currentDelta = current.ratingDelta24h ?? 0;
+          return currentDelta > bestDelta ? current : best;
+        });
+      } else {
+        const rated = withinRadius.filter((s) => ratingFor(s) != null);
+        const pool = rated.length ? rated : withinRadius;
+
+        top = pool.reduce((best, current) => {
+          const bestRating = ratingFor(best) ?? 0;
+          const currentRating = ratingFor(current) ?? 0;
+          return currentRating > bestRating ? current : best;
+        });
+      }
+    } else {
+      const ratedOverall = withDistance.filter((s) => ratingFor(s) != null);
+      const pool = ratedOverall.length ? ratedOverall : withDistance;
+
+      top = pool.reduce((best, current) => {
+        const bestRating = ratingFor(best) ?? 0;
+        const currentRating = ratingFor(current) ?? 0;
+        return currentRating > bestRating ? current : best;
+      });
+    }
+
+    setShakeOfTheDay(top);
+  }, [cloudShops, userLocation, ratingFor]);
+
+  const finishWalkthrough = async () => {
+    // ✅ Always mark as seen (even if they press "Not now")
+    await AsyncStorage.setItem(WALKTHROUGH_KEY, 'true');
     setShowWalkthrough(false);
     setWalkthroughStep(3);
   };
 
-  // ✅ FIX: final button goes straight to /login (no intermediate modal)
+  // ✅ Next button
   const handleNextWalkthrough = async () => {
-    if (walkthroughStep === 1) {
+    // ✅ Explore is now step 0, so trigger highlight after step 0
+    if (walkthroughStep === 0) {
       setShowExploreHighlight(true);
     }
 
@@ -351,14 +470,13 @@ const HomeScreen = () => {
       await finishWalkthrough();
 
       if (!user) {
-        // Go straight to login (your login screen can still offer Sign Up)
         router.push('/login');
       }
 
       return;
     }
 
-    setWalkthroughStep(prev => prev + 1);
+    setWalkthroughStep((prev) => prev + 1);
   };
 
   const handleLogout = async () => {
@@ -370,17 +488,13 @@ const HomeScreen = () => {
     }
   };
 
-  const listData: BaseShop[] =
-    nearestShops.length > 0 ? nearestShops : CORE_SHOPS;
+  // ✅ Only show Firestore shops. Nearest list appears if we have location + shops.
+  const listData: BaseShop[] = nearestShops.length > 0 ? nearestShops : cloudShops;
 
-  const step =
-    WALKTHROUGH_STEPS[
-      Math.min(walkthroughStep, WALKTHROUGH_STEPS.length - 1)
-    ];
+  const step = WALKTHROUGH_STEPS[Math.min(walkthroughStep, WALKTHROUGH_STEPS.length - 1)];
 
   const renderStepVisual = () => {
     if (step.key === 'add') {
-      // ✅ FIX: Only show the Add Shake visual (no Profile chip)
       return (
         <View style={styles.visualRowCentered}>
           <View style={styles.visualChip}>
@@ -398,29 +512,22 @@ const HomeScreen = () => {
         <View style={styles.tabPreviewRow}>
           <View style={styles.tabPreviewItem}>
             <Ionicons name="home-outline" size={24} color={theme.text.muted} />
-            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>
-              Home
-            </Text>
+            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>Home</Text>
           </View>
 
           <View style={styles.tabPreviewItem}>
             <Ionicons name="map" size={24} color={theme.text.primary} />
-            <Text style={[styles.tabPreviewText, { color: theme.text.primary }]}>
-              Explore
-            </Text>
+            <Text style={[styles.tabPreviewText, { color: theme.text.primary }]}>Explore</Text>
           </View>
 
           <View style={styles.tabPreviewItem}>
             <Ionicons name="heart-outline" size={24} color={theme.text.muted} />
-            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>
-              Favourites
-            </Text>
+            <Text style={[styles.tabPreviewText, { color: theme.text.muted }]}>Favourites</Text>
           </View>
         </View>
       );
     }
 
-    // ✅ FIX: favourites step should be ONE centred chip (no “Saved list”)
     return (
       <View style={styles.visualRowCentered}>
         <View style={styles.visualChip}>
@@ -435,37 +542,9 @@ const HomeScreen = () => {
 
   return (
     <>
+    
       <SafeAreaView style={styles.container}>
         {/* HEADER BAR */}
-        <View style={styles.header}>
-          {/* Left: Login/Profile */}
-          <TouchableOpacity
-            onPress={() => {
-              if (showWalkthrough) return;
-              if (!user) setShowLoginModal(true);
-              else setProfileMenuVisible(prev => !prev);
-            }}
-            style={styles.headerIconButton}
-            activeOpacity={0.8}
-          >
-            <Ionicons
-              name={user ? 'person' : 'person-outline'}
-              size={22}
-              color={theme.text.onBrand}
-            />
-          </TouchableOpacity>
-
-          {/* Right: Add Shake */}
-          <TouchableOpacity
-            onPress={() => !showWalkthrough && router.push('/add-shake')}
-            style={[styles.headerIconButton, styles.headerAddButton]}
-            activeOpacity={0.8}
-          >
-            <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
-              <Ionicons name="add" size={22} color={theme.text.onBrand} />
-            </Animated.View>
-          </TouchableOpacity>
-        </View>
 
         {/* MAIN CONTENT */}
         <View style={{ flex: 1 }}>
@@ -474,24 +553,33 @@ const HomeScreen = () => {
             <TouchableOpacity
               style={styles.shakeOfDayBanner}
               activeOpacity={0.9}
-              onPress={() =>
-                !showWalkthrough && router.push(`/shake/${shakeOfTheDay.id}`)
-              }
+              onPress={() => {
+                if (showWalkthrough) return;
+                router.push(`/shake/${shakeOfTheDay.id}`);
+              }}
             >
-              <Image
-                source={shakeOfTheDay.image}
-                style={styles.shakeOfDayImage}
-              />
+              <Image source={shakeOfTheDay.image} style={styles.shakeOfDayImage} />
               <View style={styles.shakeOfDayOverlay}>
                 <Text style={styles.shakeOfDayLabel}>Shake of the Day</Text>
                 <Text style={styles.shakeOfDayName}>{shakeOfTheDay.name}</Text>
 
                 <View style={styles.topFeatureMetaRow}>
-                  {shakeOfTheDay.rating != null && (
-                    <Text style={styles.shakeOfDayRating}>
-                      ⭐ {shakeOfTheDay.rating.toFixed(1)}
-                    </Text>
-                  )}
+                  {(() => {
+                    const displayRating = ratingFor(shakeOfTheDay);
+                    const displayCount =
+                      typeof shakeOfTheDay.ratingCount === 'number'
+                        ? shakeOfTheDay.ratingCount
+                        : null;
+
+                    return displayRating != null ? (
+                      <Text style={styles.shakeOfTheDayRating}>
+                        ⭐ {displayRating.toFixed(1)}
+                        {displayCount != null && displayCount > 0 ? ` (${displayCount})` : ''}
+                      </Text>
+                    ) : (
+                      <Text style={styles.shakeOfTheDayRating}>No rating yet</Text>
+                    );
+                  })()}
 
                   {typeof shakeOfTheDay.ratingDelta24h === 'number' &&
                     shakeOfTheDay.ratingDelta24h > 0 && (
@@ -504,26 +592,61 @@ const HomeScreen = () => {
             </TouchableOpacity>
           )}
 
-          <FlatList
-            data={listData}
-            keyExtractor={item => item.id}
-            contentContainerStyle={{ paddingBottom: 40 }}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                style={styles.card}
-                onPress={() =>
-                  !showWalkthrough && router.push(`/shake/${item.id}`)
-                }
-                activeOpacity={0.85}
-              >
-                <Image source={item.image} style={styles.image} />
-                <Text style={styles.name}>{item.name}</Text>
-                <Text style={styles.rating}>
-                  {item.rating != null ? `⭐ ${item.rating}` : 'No rating yet'}
-                </Text>
-              </TouchableOpacity>
-            )}
-          />
+          {/* ✅ Empty state when there are no shops */}
+          {!listData.length ? (
+            <View style={{ paddingHorizontal: 16, paddingTop: 20 }}>
+              <Text style={{ fontSize: 18, fontWeight: '800', color: theme.text.primary }}>
+                No shops yet
+              </Text>
+              <Text style={{ marginTop: 6, fontSize: 14, color: theme.text.secondary }}>
+                Add a shake to create the first shop.
+              </Text>
+            </View>
+          ) : (
+            <FlatList
+              data={listData}
+              keyExtractor={(item) => item.shopKey} // ✅ stable key
+              contentContainerStyle={{ paddingBottom: 40 }}
+              renderItem={({ item }) => {
+                const displayRating = ratingFor(item);
+                const displayCount = typeof item.ratingCount === 'number' ? item.ratingCount : null;
+
+                return (
+                  <TouchableOpacity
+                    style={styles.card}
+                    onPress={() => {
+                      if (showWalkthrough) return;
+                      router.push(`/shake/${item.id}`);
+                    }}
+                    activeOpacity={0.85}
+                  >
+                    {/* ✅ Distance badge (bottom-right on image) */}
+                    <View style={styles.imageWrapper}>
+                      <Image source={item.image} style={styles.image} />
+                      {'distanceKm' in item && typeof (item as any).distanceKm === 'number' && (
+                        <View style={styles.distanceBadge}>
+                          <Text style={styles.distanceText}>
+                            {formatDistance((item as any).distanceKm)}
+                          </Text>
+                        </View>
+                      )}
+                    </View>
+
+                    <Text style={styles.name}>{item.name}</Text>
+
+                    {displayRating == null ? (
+                      <Text style={styles.rating}>No rating yet</Text>
+                    ) : (
+                      <Text style={styles.rating}>
+                        ⭐ {displayRating.toFixed(1)}
+                        {displayCount != null && displayCount > 0 ? ` (${displayCount})` : ''}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              }}
+            />
+          )}
         </View>
       </SafeAreaView>
 
@@ -588,47 +711,31 @@ const HomeScreen = () => {
         <View style={styles.modalBackground}>
           <View style={styles.loginModal}>
             <View style={styles.closeButtonWrapper}>
-              <TouchableOpacity
-                style={styles.closeButton}
-                onPress={() => setShowLoginModal(false)}
-              >
+              <TouchableOpacity style={styles.closeButton} onPress={() => setShowLoginModal(false)}>
                 <Ionicons name="close" size={24} color={theme.text.primary} />
               </TouchableOpacity>
             </View>
             <Text style={styles.modalTitle}>
-              Save your favourite shakes — log in or register now!
-            </Text>
-            <View style={{ flexDirection: 'row', marginTop: 20 }}>
-              <TouchableOpacity
-                style={[
-                  styles.authButton,
-                  { backgroundColor: theme.controls.buttonPrimaryBg },
-                ]}
-                onPress={() => {
-                  setShowLoginModal(false);
-                  finishWalkthrough();
-                  router.push('/login');
-                }}
-              >
-                <Text style={styles.authButtonText}>Login</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[
-                  styles.authButton,
-                  {
-                    backgroundColor: theme.controls.buttonSecondaryBg,
-                    marginLeft: 10,
-                  },
-                ]}
-                onPress={() => {
-                  setShowLoginModal(false);
-                  finishWalkthrough();
-                  router.push('/signup');
-                }}
-              >
-                <Text style={styles.authButtonText}>Sign Up</Text>
-              </TouchableOpacity>
-            </View>
+  Save your favourite shakes - sign in to continue.
+</Text>
+            <View style={{ marginTop: 20 }}>
+  <TouchableOpacity
+    style={[
+      styles.authButton,
+      {
+        backgroundColor: theme.controls.buttonPrimaryBg,
+        width: '100%',
+      },
+    ]}
+    onPress={() => {
+      setShowLoginModal(false);
+      finishWalkthrough();
+      router.push('/login');
+    }}
+  >
+    <Text style={styles.authButtonText}>Continue</Text>
+  </TouchableOpacity>
+</View>
           </View>
         </View>
       </Modal>
@@ -650,13 +757,15 @@ const HomeScreen = () => {
             <Text style={styles.profileTitle}>Profile</Text>
             {user?.email && <Text style={styles.profileEmail}>{user.email}</Text>}
 
+            {/* ✅ open Preferences screen */}
             <TouchableOpacity
               style={[styles.profileButton, { marginTop: 10 }]}
-              onPress={() => {}}
+              onPress={() => {
+                setProfileMenuVisible(false);
+                router.push('/preferences');
+              }}
             >
-              <Text style={styles.profileButtonText}>
-                Preferences (coming soon)
-              </Text>
+              <Text style={styles.profileButtonText}>Preferences</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -676,14 +785,7 @@ const HomeScreen = () => {
               ]}
               onPress={handleLogout}
             >
-              <Text
-                style={[
-                  styles.profileButtonText,
-                  { color: theme.status.error },
-                ]}
-              >
-                Logout
-              </Text>
+              <Text style={[styles.profileButtonText, { color: theme.status.error }]}>Logout</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -698,15 +800,6 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: theme.app.screenBackground,
-  },
-
-  header: {
-    height: HEADER_HEIGHT,
-    paddingHorizontal: 20,
-    paddingTop: 5,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
   },
 
   headerIconButton: {
@@ -748,7 +841,7 @@ const styles = StyleSheet.create({
 
   shakeOfDayOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.35)',
+    backgroundColor: 'rgba(0,0,0,0.08)',
     justifyContent: 'flex-end',
     padding: 14,
   },
@@ -767,7 +860,7 @@ const styles = StyleSheet.create({
     color: '#fff',
   },
 
-  shakeOfDayRating: {
+  shakeOfTheDayRating: {
     fontSize: 14,
     fontWeight: '600',
     color: '#fff',
@@ -797,10 +890,30 @@ const styles = StyleSheet.create({
     borderColor: theme.surface.border,
   },
 
+  imageWrapper: {
+    position: 'relative',
+  },
+
   image: {
     width: '100%',
     height: 150,
     borderRadius: 10,
+  },
+
+  distanceBadge: {
+    position: 'absolute',
+    right: 8,
+    bottom: 8,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+
+  distanceText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '800',
   },
 
   name: {
@@ -854,7 +967,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
 
-  // ✅ used when there is only ONE chip (Add step + Favourites step)
   visualRowCentered: {
     flexDirection: 'row',
     marginTop: 16,
@@ -917,8 +1029,6 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 16,
     marginBottom: 16,
-
-    // ✅ FIX: centre the dots
     justifyContent: 'center',
     alignItems: 'center',
     width: '100%',
@@ -1018,7 +1128,7 @@ const styles = StyleSheet.create({
 
   profileBackdrop: {
     position: 'absolute',
-    top: HEADER_HEIGHT,
+    top: 90,
     left: 0,
     right: 0,
     bottom: 0,
@@ -1026,7 +1136,7 @@ const styles = StyleSheet.create({
 
   profileMenu: {
     position: 'absolute',
-    top: HEADER_HEIGHT + 50,
+    top: 90,
     left: 20,
     backgroundColor: theme.surface.card,
     borderRadius: 10,

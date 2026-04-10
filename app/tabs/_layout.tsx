@@ -1,21 +1,27 @@
 // app/tabs/_layout.tsx
 import { Ionicons } from '@expo/vector-icons';
-import { Tabs } from 'expo-router';
+import { Tabs, useRouter } from 'expo-router';
+import { TouchableOpacity } from 'react-native';
 import { theme } from '../../constants/colors';
+import { useAuth } from '../../context/AuthContext';
 import { ExploreHighlightProvider } from '../../context/ExploreHighlightContext';
 
+const ADMIN_UID = 'JP7PKiVf2ZUjMEg6McrMbrozjf03';
+
 export default function Layout() {
+  const router = useRouter();
+  const { user } = useAuth();
+  const isAdmin = user?.uid === ADMIN_UID;
+
   return (
     <ExploreHighlightProvider>
       <Tabs
         screenOptions={({ route }) => ({
           headerShown: false,
 
-          // Active / inactive colours
           tabBarActiveTintColor: theme.text.primary,
           tabBarInactiveTintColor: theme.text.muted,
 
-          // Tab bar surface
           tabBarStyle: {
             height: 80,
             paddingBottom: 20,
@@ -25,7 +31,6 @@ export default function Layout() {
             borderTopColor: theme.surface.border,
           },
 
-          // Label style (DON'T set color here, tintColor handles it)
           tabBarLabelStyle: {
             fontSize: 13,
             fontWeight: '600',
@@ -54,20 +59,41 @@ export default function Layout() {
           options={{
             title: 'Home',
             tabBarLabel: 'Home',
+
+            // ✅ Header ON for Home so we get a top-right button
+            headerShown: true,
+            headerTitle: 'ShakeMap',
+            headerStyle: { backgroundColor: theme.surface.sheet },
+            headerTitleStyle: { color: theme.text.primary },
+            headerTintColor: theme.text.primary,
+
+            headerRight: () =>
+              isAdmin ? (
+                <TouchableOpacity
+                  onPress={() => router.push('/moderation')}
+                  style={{ marginRight: 14 }}
+                >
+                  <Ionicons name="shield-checkmark" size={24} color={theme.text.primary} />
+                </TouchableOpacity>
+              ) : null,
           }}
         />
+
         <Tabs.Screen
           name="explore"
           options={{
             title: 'Explore',
             tabBarLabel: 'Explore',
+            headerShown: false,
           }}
         />
+
         <Tabs.Screen
           name="favourites"
           options={{
             title: 'Favourites',
             tabBarLabel: 'Favourites',
+            headerShown: false,
           }}
         />
       </Tabs>

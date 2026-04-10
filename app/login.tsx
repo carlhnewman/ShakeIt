@@ -1,50 +1,92 @@
-// app/login.tsx
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import React, { useMemo, useState } from 'react';
+import React, { useEffect } from 'react';
 import {
-  ActivityIndicator,
   Image,
   KeyboardAvoidingView,
   Platform,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
+
+import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { theme } from '../constants/colors';
-import { loginWithEmail } from '../hooks/authHelpers';
+
+import * as AppleAuthentication from 'expo-apple-authentication';
+import * as Google from 'expo-auth-session/providers/google';
+import * as WebBrowser from 'expo-web-browser';
+const GOOGLE_ICON = require('../assets/images/google.png');
+
+WebBrowser.maybeCompleteAuthSession();
+
+
+import { GoogleAuthProvider, OAuthProvider, signInWithCredential } from 'firebase/auth';
+import { auth } from '../firebase';
 
 const MILKSHAKE_ICON = require('../assets/images/milkshake-icon.png');
 
 export default function LoginScreen() {
   const router = useRouter();
 
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
+  const [request, response, promptAsync] = Google.useIdTokenAuthRequest({
+  iosClientId: '740761063675-rinofgh5q5f8th9hngmn918katn75q70.apps.googleusercontent.com',
+  androidClientId: '740761063675-tnt2en1008oirnal8ikbhdrfmd20bppq.apps.googleusercontent.com',
+});
 
-  const [showPassword, setShowPassword] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+console.log('REQUEST:', request);
 
-  const canSubmit = useMemo(() => {
-    const e = email.trim();
-    return e.length > 3 && password.length >= 6 && !submitting;
-  }, [email, password, submitting]);
+  // ✅ Google login handler
+  useEffect(() => {
+  if (response?.type === 'success') {
+    const { id_token } = response.params;
 
-  const handleLogin = async () => {
-    if (!canSubmit) return;
+    const credential = GoogleAuthProvider.credential(id_token);
+    signInWithCredential(auth, credential)
+      .then(() => {
+        router.replace('/');
+      })
+      .catch((error) => {
+        console.error('Firebase login error:', error);
+      });
+  }
+}, [response]);
 
+// 👇 ADD THIS HERE (not in JSX)
+useEffect(() => {
+  console.log('AUTH RESPONSE:', response);
+}, [response]);
+
+// 👇 ADD THIS ONE HERE
+useEffect(() => {
+  console.log('REQUEST CHANGED:', request);
+}, [request]);
+
+  const handleAppleLogin = async () => {
     try {
-      setSubmitting(true);
-      await loginWithEmail(email.trim(), password);
+      const appleCredential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+        ],
+      });
+
+      const provider = new OAuthProvider('apple.com');
+
+      const credential = provider.credential({
+        idToken: appleCredential.identityToken!,
+      });
+
+      await signInWithCredential(auth, credential);
+
       router.replace('/');
-    } catch (error: any) {
-      alert('Login failed: ' + (error?.message ?? 'Unknown error'));
-    } finally {
-      setSubmitting(false);
+    } catch (err: any) {
+      if (err.code !== 'ERR_CANCELED') {
+        alert(err.message);
+      }
     }
   };
 
@@ -59,25 +101,22 @@ export default function LoginScreen() {
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {/* Back to home */}
+          <View>
+          {/* Back Button */}
           <View style={styles.headerRow}>
             <TouchableOpacity
               style={styles.backButtonRow}
-              onPress={() => router.replace('/')} // ✅ always go straight home
+              onPress={() => router.replace('/')}
               activeOpacity={0.8}
             >
-              <Ionicons
-                name="chevron-back"
-                size={18}
-                color={theme.text.primary}
-              />
+              <Ionicons name="chevron-back" size={18} color={theme.text.primary} />
               <Text style={styles.backText}>Back to home</Text>
             </TouchableOpacity>
           </View>
 
           {/* Card */}
           <View style={styles.formCard}>
-            {/* Brand row */}
+            {/* Logo + Title */}
             <View style={styles.brandRow}>
               <View style={styles.brandIcon}>
                 <Image
@@ -88,104 +127,103 @@ export default function LoginScreen() {
               </View>
 
               <View style={{ flex: 1 }}>
-                <Text style={styles.title}>Login</Text>
+                <Text style={styles.title}>Welcome</Text>
                 <Text style={styles.subtitle}>
-                  Save favourites, add shakes, and rate the best spots.
+                  Discover and rate the best milkshakes near you.
                 </Text>
               </View>
             </View>
 
-            {/* Email */}
-            <Text style={styles.label}>Email</Text>
-            <View style={styles.inputRow}>
-              <Ionicons
-                name="mail-outline"
-                size={18}
-                color={theme.text.muted}
-              />
-              <TextInput
-                placeholder="you@example.com"
-                placeholderTextColor={theme.controls.inputPlaceholder}
-                value={email}
-                onChangeText={setEmail}
-                style={styles.input}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="email-address"
-                returnKeyType="next"
-              />
-            </View>
-
-            {/* Password */}
-            <Text style={[styles.label, { marginTop: 10 }]}>Password</Text>
-            <View style={styles.inputRow}>
-              <Ionicons
-                name="lock-closed-outline"
-                size={18}
-                color={theme.text.muted}
-              />
-              <TextInput
-                placeholder="Your password"
-                placeholderTextColor={theme.controls.inputPlaceholder}
-                value={password}
-                onChangeText={setPassword}
-                style={styles.input}
-                secureTextEntry={!showPassword}
-                returnKeyType="done"
-                onSubmitEditing={handleLogin}
-              />
-
+            {/* Buttons */}
+            <View style={{ marginTop: 20 }}>
+              {/* Google */}
               <TouchableOpacity
-                onPress={() => setShowPassword(prev => !prev)}
-                activeOpacity={0.8}
-                style={styles.eyeButton}
-              >
-                <Ionicons
-                  name={showPassword ? 'eye-off-outline' : 'eye-outline'}
-                  size={18}
-                  color={theme.text.muted}
+  style={[
+    styles.button,
+    {
+      backgroundColor: '#fff',
+      borderWidth: 1,
+      borderColor: '#ddd',
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 10,
+    },
+  ]}
+  onPress={() => {
+  console.log('LOGIN BUTTON PRESSED');
+
+  if (!request) {
+    console.log('REQUEST NOT READY');
+    return;
+  }
+
+  promptAsync();
+}}
+>
+  <Image
+    source={GOOGLE_ICON}
+    style={{ width: 20, height: 20 }}
+  />
+  <Text style={[styles.buttonText, { color: '#000' }]}>
+    Continue with Google
+  </Text>
+</TouchableOpacity>
+
+              {/* Apple */}
+              {Platform.OS === 'ios' && (
+                <AppleAuthentication.AppleAuthenticationButton
+                  buttonType={
+                    AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN
+                  }
+                  buttonStyle={
+                    AppleAuthentication.AppleAuthenticationButtonStyle.BLACK
+                  }
+                  cornerRadius={12}
+                  style={{ width: '100%', height: 54, marginTop: 10 }}
+                  onPress={handleAppleLogin}
                 />
-              </TouchableOpacity>
-            </View>
-
-            {/* Forgot password */}
-            <TouchableOpacity
-              onPress={() => {
-                alert('Forgot password coming next.');
-              }}
-              activeOpacity={0.85}
-              style={styles.forgotRow}
-            >
-              <Text style={styles.forgotText}>Forgot password?</Text>
-            </TouchableOpacity>
-
-            {/* Login button */}
-            <TouchableOpacity
-              style={[styles.button, !canSubmit && styles.buttonDisabled]}
-              onPress={handleLogin}
-              activeOpacity={0.85}
-              disabled={!canSubmit}
-            >
-              {submitting ? (
-                <ActivityIndicator />
-              ) : (
-                <Text style={styles.buttonText}>Login</Text>
               )}
-            </TouchableOpacity>
 
-            {/* Switch to signup */}
-            <View style={styles.bottomRow}>
-              <Text style={styles.bottomText}>Don’t have an account?</Text>
-              <TouchableOpacity
-                onPress={() => router.replace('/signup')} // ✅ replace instead of push
-                activeOpacity={0.85}
+              {/* Divider */}
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  marginVertical: 16,
+                }}
               >
-                <Text style={styles.bottomLink}> Sign Up</Text>
+                <View
+                  style={{ flex: 1, height: 1, backgroundColor: '#ddd' }}
+                />
+                <Text
+                  style={{
+                    marginHorizontal: 10,
+                    color: '#888',
+                    fontWeight: '600',
+                  }}
+                >
+                  OR
+                </Text>
+                <View
+                  style={{ flex: 1, height: 1, backgroundColor: '#ddd' }}
+                />
+              </View>
+
+              {/* Email */}
+              <TouchableOpacity
+                style={[styles.button, { backgroundColor: '#eee' }]}
+                onPress={() => router.push('/email-auth')}
+              >
+                <Text style={[styles.buttonText, { color: '#000' }]}>
+                  Continue with Email
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
 
           <View style={{ height: 20 }} />
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -198,128 +236,59 @@ const styles = StyleSheet.create({
     backgroundColor: theme.app.screenBackground,
     paddingHorizontal: 16,
   },
-
   scrollContent: {
     flexGrow: 1,
     paddingTop: 14,
     paddingBottom: 20,
     justifyContent: 'center',
   },
-
   headerRow: {
-    position: 'absolute',
-    top: 10,
-    left: 16,
-    right: 16,
-    zIndex: 2,
-  },
-
+  marginBottom: 12,
+},
   backButtonRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    alignSelf: 'flex-start',
-    paddingVertical: 6,
-    paddingHorizontal: 6,
-    borderRadius: 10,
+    padding: 6,
   },
-
   backText: {
     marginLeft: 4,
     fontSize: 14,
     color: theme.text.primary,
     fontWeight: '600',
   },
-
   formCard: {
     backgroundColor: theme.surface.card,
     borderRadius: 16,
-    paddingHorizontal: 16,
-    paddingVertical: 18,
+    padding: 16,
     borderWidth: 1,
     borderColor: theme.surface.border,
   },
-
   brandRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    marginBottom: 14,
+    marginBottom: 10,
   },
-
-  // ✅ PNG already has the green circle, so keep the container transparent
   brandIcon: {
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: 'transparent',
-    alignItems: 'center',
-    justifyContent: 'center',
     overflow: 'hidden',
   },
-
-  // ✅ show the icon exactly as-is (NO tintColor)
   brandIconImage: {
     width: 36,
     height: 36,
-    borderRadius: 18,
   },
-
   title: {
     fontSize: 28,
     fontWeight: '900',
     color: theme.text.primary,
   },
-
   subtitle: {
-    marginTop: 3,
     fontSize: 13,
     color: theme.text.secondary,
     fontWeight: '600',
   },
-
-  label: {
-    fontSize: 13,
-    fontWeight: '800',
-    color: theme.text.secondary,
-    marginBottom: 6,
-    marginTop: 6,
-  },
-
-  inputRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    borderWidth: 1,
-    borderColor: theme.surface.border,
-    backgroundColor: theme.controls.inputBg,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    height: 52,
-  },
-
-  input: {
-    flex: 1,
-    fontSize: 16,
-    color: theme.text.primary,
-  },
-
-  eyeButton: {
-    padding: 6,
-    borderRadius: 10,
-  },
-
-  forgotRow: {
-    marginTop: 10,
-    alignSelf: 'flex-end',
-  },
-
-  forgotText: {
-    color: theme.text.primary,
-    fontWeight: '700',
-    fontSize: 13,
-    opacity: 0.85,
-  },
-
   button: {
     marginTop: 14,
     backgroundColor: theme.controls.buttonPrimaryBg,
@@ -328,33 +297,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-
   buttonText: {
     color: theme.text.onBrand,
     fontWeight: '900',
     fontSize: 18,
-  },
-
-  bottomRow: {
-    marginTop: 14,
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-
-  bottomText: {
-    color: theme.text.secondary,
-    fontWeight: '700',
-    fontSize: 14,
-  },
-
-  bottomLink: {
-    color: theme.text.primary,
-    fontWeight: '900',
-    fontSize: 14,
   },
 });

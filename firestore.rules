@@ -1,0 +1,155 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================
+    // Helpers
+    // =========================
+
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.admin == true;
+    }
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // =========================
+    // Shops Collection
+    // =========================
+    match /shops/{shopId} {
+
+      // Public can read shops
+      allow read: if true;
+
+      // 🔒 Shops can ONLY be created via Cloud Functions (Admin SDK)
+      allow create: if false;
+
+      // 🔒 ONLY ADMIN can update shops
+      // (Protects ratingAverage, ratingCount, previewPhotoUrl, etc.)
+      allow update: if isAdmin();
+
+      // Only admin can delete shop docs
+      allow delete: if isAdmin();
+
+      // =========================
+      // Posts subcollection
+      // =========================
+      match /posts/{postId} {
+
+        // Non-admins can only read approved posts
+        // Admin can read everything
+        allow get, list: if isAdmin() || resource.data.approved == true;
+
+        // Users can create posts (must not self-approve)
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly([
+            "shopId",
+            "userId",
+            "caption",
+            "photoUrls",
+            "approved",
+            "createdAt"
+          ])
+          && request.resource.data.shopId == shopId
+          && request.resource.data.userId == request.auth.uid
+          && (request.resource.data.caption is string
+              || !("caption" in request.resource.data))
+          && request.resource.data.photoUrls is list
+          && request.resource.data.photoUrls.size() <= 10
+          && request.resource.data.approved == false
+          && ("createdAt" in request.resource.data);
+
+        // Admin can update anything (including approval)
+        // Owner can only update caption + photoUrls BEFORE approval
+        allow update: if isAdmin()
+          || (
+            signedIn()
+            && resource.data.userId == request.auth.uid
+            && resource.data.approved == false
+            && request.resource.data.keys().hasOnly([
+              "shopId",
+              "userId",
+              "caption",
+              "photoUrls",
+              "approved",
+              "createdAt"
+            ])
+            && request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["caption", "photoUrls"])
+            && request.resource.data.photoUrls is list
+            && request.resource.data.photoUrls.size() <= 10
+            && request.resource.data.approved == resource.data.approved
+          );
+
+        allow delete: if isAdmin()
+          || (signedIn() && resource.data.userId == request.auth.uid);
+      }
+
+      // =========================
+      // Comments subcollection
+      // =========================
+      match /comments/{commentId} {
+
+        allow read: if true;
+
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly([
+            "shopId",
+            "userId",
+            "text",
+            "createdAt"
+          ])
+          && request.resource.data.shopId == shopId
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 500
+          && ("createdAt" in request.resource.data);
+
+        allow update: if isAdmin()
+          || (
+            signedIn()
+            && resource.data.userId == request.auth.uid
+            && request.resource.data.diff(resource.data).changedKeys()
+              .hasOnly(["text"])
+            && request.resource.data.text is string
+            && request.resource.data.text.size() > 0
+            && request.resource.data.text.size() <= 500
+          );
+
+        allow delete: if isAdmin()
+          || (signedIn() && resource.data.userId == request.auth.uid);
+      }
+
+      // =========================
+      // Ratings subcollection
+      // =========================
+      match /ratings/{uid} {
+
+        allow read: if true;
+
+        allow create, update: if signedIn()
+          && uid == request.auth.uid
+          && request.resource.data.keys()
+              .hasOnly(["rating", "createdAt", "updatedAt"])
+          && request.resource.data.rating is number
+          && request.resource.data.rating >= 1
+          && request.resource.data.rating <= 5;
+
+        allow delete: if signedIn() && uid == request.auth.uid;
+
+        // Prevent listing all ratings
+        allow list: if false;
+      }
+    }
+
+    // =========================
+    // Admin collectionGroup read
+    // =========================
+    match /{path=**}/posts/{postId} {
+      allow read: if isAdmin();
+    }
+  }
+}

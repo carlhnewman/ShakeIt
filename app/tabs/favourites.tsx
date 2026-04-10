@@ -1,60 +1,32 @@
 // app/tabs/favourites.tsx
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useRouter } from 'expo-router';
-import { collection, getDocs } from 'firebase/firestore';
-import React, { useEffect, useState } from 'react';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { collection, onSnapshot, query } from 'firebase/firestore';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
   Image,
-  SafeAreaView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme } from '../../constants/colors';
 import { db } from '../../firebase';
 
-// Core, hard-coded shops (match IDs used in Home / Explore / Details)
-const CORE_SHOPS = [
-  {
-    id: '1',
-    name: "Captain Morgan's",
-    area: 'Gisborne',
-    address: '285 Grey Street, Gisborne',
-    rating: 4.5,
-    priceLine: '$9 Thick Shake, $6.5 Milkshake',
-    image: require('../../assets/images/captainmorgans.png'),
-  },
-  {
-    id: '2',
-    name: 'Te Poi Cafe',
-    area: 'Te Poi',
-    address: '5 Te Poi Road, Te Poi',
-    rating: 4.5,
-    priceLine: '$8 Thick Shake, $6 Milkshake',
-    image: require('../../assets/images/tepoicafe.png'),
-  },
-  {
-    id: '3',
-    name: 'Hot Bread Shop Cafe',
-    area: 'Ōpōtiki',
-    address: '43 Saint John Street, Ōpōtiki',
-    rating: 4.0,
-    priceLine: '$8 Thick Shake, $5.5 Milkshake',
-    image: require('../../assets/images/hotbreadshop.png'),
-  },
-];
+// ✅ Versioned storage key (prevents old junk favouriting old IDs)
+const FAV_KEY_V2 = 'favourites_v2';
+const FAV_KEY_V1 = 'favourites';
 
 type DisplayShop = {
   id: string;
   name: string;
   rating: number | null;
   priceLine?: string;
-  addressLine?: string; // this is what we actually show: area/suburb
-  area?: string;
-  image: any;
+  addressLine?: string;
+  image: any; // require(...) or {uri}
 };
 
 const DEFAULT_IMAGE = require('../../assets/images/defaultshake.png');
@@ -63,119 +35,218 @@ const DEFAULT_IMAGE = require('../../assets/images/defaultshake.png');
 const getAreaFromAddress = (address?: string): string | undefined => {
   if (!address) return undefined;
   const parts = address.split(',');
-  if (parts.length >= 2) {
-    return parts[1].trim();
-  }
+  if (parts.length >= 2) return parts[1].trim();
   return undefined;
+};
+
+// ✅ helper: safe https uri image
+const safeUri = (url: any) => {
+  const u = typeof url === 'string' ? url.trim() : '';
+  return u.startsWith('https://') ? { uri: u } : null;
 };
 
 const FavouritesScreen = () => {
   const router = useRouter();
+
   const [favouriteIds, setFavouriteIds] = useState<string[]>([]);
-  const [shops, setShops] = useState<DisplayShop[]>([]);
+  const [shopDocById, setShopDocById] = useState<Map<string, any>>(new Map());
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const stored = await AsyncStorage.getItem('favourites');
-        const ids: string[] = stored ? JSON.parse(stored) : [];
-        setFavouriteIds(ids);
+  const unsubRef = useRef<null | (() => void)>(null);
 
-        // Core shops that are in favourites
-        const coreMatches: DisplayShop[] = CORE_SHOPS.filter((s) =>
-          ids.includes(s.id),
-        ).map((s) => ({
-          id: s.id,
-          name: s.name,
-          rating: s.rating,
-          priceLine: s.priceLine,
-          // show just "Gisborne", "Te Poi", etc.
-          addressLine: s.area,
-          area: s.area,
-          image: s.image,
-        }));
+  const loadFavouriteIds = useCallback(async () => {
+    // 1) Load favourites (v2), with a one-time migration from v1
+    let ids: string[] = [];
 
-        // Firestore shops (user-added)
-        const snap = await getDocs(collection(db, 'shops'));
-        const cloudMatches: DisplayShop[] = snap.docs
-          .filter((doc) => ids.includes(doc.id))
-          .map((doc) => {
-            const data = doc.data() as any;
-            const milk = data.milkshakePrice;
-            const thick = data.thickshakePrice;
-            let priceLine: string | undefined;
+    const rawV2 = await AsyncStorage.getItem(FAV_KEY_V2);
+    if (rawV2) {
+      ids = JSON.parse(rawV2);
+    } else {
+      const rawV1 = await AsyncStorage.getItem(FAV_KEY_V1);
+      const v1Ids: string[] = rawV1 ? JSON.parse(rawV1) : [];
 
-            if (milk && thick) {
-              priceLine = `$${(typeof milk === 'number' ? milk.toFixed(2) : milk)} Milkshake, $${(typeof thick === 'number' ? thick.toFixed(2) : thick)} Thick Shake`;
-            } else if (milk) {
-              priceLine = `$${(typeof milk === 'number' ? milk.toFixed(2) : milk)} Milkshake`;
-            } else if (thick) {
-              priceLine = `$${(typeof thick === 'number' ? thick.toFixed(2) : thick)} Thick Shake`;
-            }
+      ids = Array.from(
+        new Set(
+          (Array.isArray(v1Ids) ? v1Ids : [])
+            .map((x) => String(x))
+            .filter((x) => x.trim().length > 0),
+        ),
+      );
 
-            const area = getAreaFromAddress(data.address);
+      await AsyncStorage.setItem(FAV_KEY_V2, JSON.stringify(ids));
+    }
 
-            return {
-              id: doc.id,
-              name: data.name ?? 'Unknown shop',
-              rating: data.rating ?? null,
-              priceLine,
-              // show area/suburb if we can derive it, otherwise fall back to full address
-              addressLine: area ?? (data.address ?? ''),
-              area,
-              image: DEFAULT_IMAGE,
-            } as DisplayShop;
-          });
-
-        setShops([...coreMatches, ...cloudMatches]);
-      } catch (err) {
-        console.error('Error loading favourites:', err);
-        setShops([]);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    load();
+    setFavouriteIds(ids);
+    return ids;
   }, []);
 
-  const renderItem = ({ item }: { item: DisplayShop }) => {
-    const handlePress = () => {
-      router.push(`/shake/${item.id}`);
-    };
+  // ✅ Re-load favourites + re-subscribe every time this tab is focused
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
 
+      const run = async () => {
+        setLoading(true);
+
+        try {
+          const ids = await loadFavouriteIds();
+
+          // stop previous listener if any
+          if (unsubRef.current) {
+            unsubRef.current();
+            unsubRef.current = null;
+          }
+
+          // If no favourites, clear and bail
+          if (!ids.length) {
+            setShopDocById(new Map());
+            setLoading(false);
+            return;
+          }
+
+          // 2) Live listen to shops so images/ratings update instantly
+          const q = query(collection(db, 'shops'));
+
+          const unsub = onSnapshot(
+            q,
+            async (snap) => {
+              if (cancelled) return;
+
+              const next = new Map<string, any>();
+              snap.docs.forEach((d) => next.set(d.id, d.data() as any));
+              setShopDocById(next);
+
+              // 3) Clean up any favourite IDs that no longer exist in Firestore
+              const cleanedIds = ids.filter((id) => next.has(id));
+
+              if (cleanedIds.length !== ids.length) {
+                setFavouriteIds(cleanedIds);
+                await AsyncStorage.setItem(FAV_KEY_V2, JSON.stringify(cleanedIds));
+              }
+
+              setLoading(false);
+            },
+            (err) => {
+              console.error('Favourites shops listener failed:', err);
+              setShopDocById(new Map());
+              setLoading(false);
+            },
+          );
+
+          unsubRef.current = unsub;
+        } catch (err) {
+          console.error('Error loading favourites:', err);
+          setFavouriteIds([]);
+          setShopDocById(new Map());
+          setLoading(false);
+        }
+      };
+
+      run();
+
+      return () => {
+        cancelled = true;
+        if (unsubRef.current) {
+          unsubRef.current();
+          unsubRef.current = null;
+        }
+      };
+    }, [loadFavouriteIds]),
+  );
+
+  const shops: DisplayShop[] = useMemo(() => {
+    if (!favouriteIds.length) return [];
+
+    const list: DisplayShop[] = favouriteIds
+      .map((id) => {
+        const data = shopDocById.get(id);
+        if (!data) return null;
+
+        const name = typeof data.name === 'string' ? data.name : 'Unknown shop';
+
+        const ratingAverage =
+          typeof data.ratingAverage === 'number'
+            ? data.ratingAverage
+            : data.ratingAverage != null
+            ? Number(data.ratingAverage)
+            : null;
+
+        const ratingLegacy =
+          typeof data.rating === 'number'
+            ? data.rating
+            : data.rating != null
+            ? Number(data.rating)
+            : null;
+
+        const rating = ratingAverage != null ? ratingAverage : ratingLegacy != null ? ratingLegacy : null;
+
+        const milk = data.milkshakePrice;
+        const thick = data.thickshakePrice;
+
+        const milkNum = typeof milk === 'number' ? milk : milk != null ? Number(milk) : null;
+        const thickNum = typeof thick === 'number' ? thick : thick != null ? Number(thick) : null;
+
+        let priceLine: string | undefined = undefined;
+        if (milkNum != null && thickNum != null) {
+          priceLine = `$${thickNum.toFixed(2)} Thick Shake, $${milkNum.toFixed(2)} Milkshake`;
+        } else if (milkNum != null) {
+          priceLine = `$${milkNum.toFixed(2)} Milkshake`;
+        } else if (thickNum != null) {
+          priceLine = `$${thickNum.toFixed(2)} Thick Shake`;
+        }
+
+        const address = typeof data.address === 'string' ? data.address : '';
+        const area = getAreaFromAddress(address);
+        const addressLine = area ?? address;
+
+        const preview = safeUri(data.previewPhotoUrl);
+        const image = preview ?? DEFAULT_IMAGE;
+
+        return {
+          id,
+          name,
+          rating,
+          priceLine,
+          addressLine,
+          image,
+        } as DisplayShop;
+      })
+      .filter(Boolean) as DisplayShop[];
+
+    // ensure unique
+    return Array.from(new Map(list.map((s) => [s.id, s])).values());
+  }, [favouriteIds, shopDocById]);
+
+  const renderItem = ({ item }: { item: DisplayShop }) => {
     return (
       <TouchableOpacity
         style={styles.card}
-        onPress={handlePress}
+        onPress={() => router.push(`/shake/${item.id}`)}
         activeOpacity={0.8}
       >
         <Image source={item.image} style={styles.image} />
+
         <View style={styles.cardContent}>
           <View style={styles.titleRow}>
             <Text style={styles.name} numberOfLines={2}>
               {item.name}
             </Text>
+
             {item.rating != null && (
               <View style={styles.ratingPill}>
-                <Ionicons
-                  name="star"
-                  size={14}
-                  color={theme.text.onBrand}
-                />
-                <Text style={styles.ratingText}>
-                  {item.rating.toFixed(1)}
-                </Text>
+                <Ionicons name="star" size={14} color={theme.text.onBrand} />
+                <Text style={styles.ratingText}>{item.rating.toFixed(1)}</Text>
               </View>
             )}
           </View>
-          {item.priceLine && (
+
+          {!!item.priceLine && (
             <Text style={styles.price} numberOfLines={1}>
               {item.priceLine}
             </Text>
           )}
-          {item.addressLine && (
+
+          {!!item.addressLine && (
             <Text style={styles.address} numberOfLines={1}>
               {item.addressLine}
             </Text>
@@ -209,9 +280,12 @@ const FavouritesScreen = () => {
   }
 
   return (
-    <SafeAreaView style={styles.screen}>
-      <Text style={styles.header}>Favourites</Text>
-      <FlatList
+    <SafeAreaView style={styles.screen} edges={['top']}>
+  <View style={styles.headerContainer}>
+    <Text style={styles.header}>Favourites</Text>
+  </View>
+
+  <FlatList
         data={shops}
         keyExtractor={(item) => item.id}
         renderItem={renderItem}
@@ -228,12 +302,18 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: theme.app.screenBackground,
   },
+  headerContainer: {
+  paddingTop: 12,
+  paddingHorizontal: 16,
+  paddingBottom: 6,
+  backgroundColor: theme.app.screenBackground,
+},
   header: {
     fontSize: 28,
     fontWeight: '800',
     color: theme.text.primary,
     paddingHorizontal: 16,
-    marginTop: 8,      // bring it down from the very top
+    marginTop: 8,
     marginBottom: 12,
   },
   card: {

@@ -1,8 +1,7 @@
 {
   "functions": [
     {
-      "source": "functions",
-      "codebase": "default",
+      "codebase": "places",
       "disallowLegacyRuntimeConfig": true,
       "ignore": [
         "node_modules",
@@ -11,10 +10,10 @@
         "firebase-debug.*.log",
         "*.local"
       ],
-      "predeploy": [
-        "npm --prefix \"$RESOURCE_DIR\" run lint",
-        "npm --prefix \"$RESOURCE_DIR\" run build"
-      ]
+      "source": "places"
     }
-  ]
+  ],
+  "firestore": {
+    "rules": "firestore.rules"
+  }
 }
